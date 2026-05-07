@@ -6,6 +6,7 @@ from pathlib import Path
 from functools import lru_cache
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, dcc, html
@@ -332,37 +333,57 @@ def ordered_star_points(star: pd.DataFrame) -> pd.DataFrame:
 def first_last_pairs(df: pd.DataFrame, group_cols: list[str], metric: str, value_col: str = "value") -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    rows = []
-    for keys, group in df.groupby(group_cols):
-        group = group.loc[group[value_col].notna()].sort_values("time_order")
-        if len(group) < 2:
-            continue
-        first = group.iloc[0]
-        last = group.iloc[-1]
-        if first["time_order"] == last["time_order"]:
-            continue
-        key_values = keys if isinstance(keys, tuple) else (keys,)
-        row = dict(zip(group_cols, key_values))
-        row.update(
-            {
-                "metric": metric,
-                "subject": row.get("subject", metric),
-                "student_group": last.get("student_group", first.get("student_group")),
-                "student_name": last.get("student_name", first.get("student_name")),
-                "start_label": first.get("time_label", first.get("school_year", "")),
-                "end_label": last.get("time_label", last.get("school_year", "")),
-                "start_value": first[value_col],
-                "end_value": last[value_col],
-                "change": last[value_col] - first[value_col],
-            }
-        )
-        row["change_status"] = "Stayed Same"
-        if row["change"] > 0:
-            row["change_status"] = "Improved"
-        elif row["change"] < 0:
-            row["change_status"] = "Regressed"
-        rows.append(row)
-    return pd.DataFrame(rows)
+    working = df.loc[df[value_col].notna(), group_cols + [value_col, "time_order", "time_label", "student_group", "student_name"]].sort_values(group_cols + ["time_order"])
+    if working.empty:
+        return pd.DataFrame()
+    first = working.drop_duplicates(group_cols, keep="first").rename(
+        columns={
+            value_col: f"{value_col}_start",
+            "time_order": "time_order_start",
+            "time_label": "time_label_start",
+            "student_group": "student_group_start",
+            "student_name": "student_name_start",
+        }
+    )
+    last = working.drop_duplicates(group_cols, keep="last").rename(
+        columns={
+            value_col: f"{value_col}_end",
+            "time_order": "time_order_end",
+            "time_label": "time_label_end",
+            "student_group": "student_group_end",
+            "student_name": "student_name_end",
+        }
+    )
+    merged = first.merge(last, on=group_cols, suffixes=("_start", "_end"))
+    merged = merged.loc[:, ~merged.columns.duplicated()].copy()
+    merged = merged[merged["time_order_start"] != merged["time_order_end"]].copy()
+    if merged.empty:
+        return pd.DataFrame()
+    merged["metric"] = metric
+    merged["subject"] = merged["subject"] if "subject" in merged.columns else metric
+    merged["student_group"] = merged["student_group_end"].combine_first(merged["student_group_start"])
+    merged["student_name"] = merged["student_name_end"].combine_first(merged["student_name_start"])
+    merged["start_label"] = merged["time_label_start"].fillna(merged["school_year_start"] if "school_year_start" in merged.columns else "")
+    merged["end_label"] = merged["time_label_end"].fillna(merged["school_year_end"] if "school_year_end" in merged.columns else "")
+    merged["start_value"] = merged[f"{value_col}_start"]
+    merged["end_value"] = merged[f"{value_col}_end"]
+    merged["change"] = merged["end_value"] - merged["start_value"]
+    merged["change_status"] = "Stayed Same"
+    merged.loc[merged["change"] > 0, "change_status"] = "Improved"
+    merged.loc[merged["change"] < 0, "change_status"] = "Regressed"
+    keep_cols = list(dict.fromkeys(group_cols + [
+        "metric",
+        "subject",
+        "student_group",
+        "student_name",
+        "start_label",
+        "end_label",
+        "start_value",
+        "end_value",
+        "change",
+        "change_status",
+    ]))
+    return merged[keep_cols]
 
 
 def overview_outcome_pairs(dfs) -> pd.DataFrame:
@@ -407,7 +428,10 @@ def overview_outcome_pairs(dfs) -> pd.DataFrame:
             ]
         )
     out = pd.concat([p for p in pieces if len(p)], ignore_index=True)
-    out["outcome"] = out["metric"] + " " + out["subject"].where(out["metric"].ne("Attendance"), "")
+    out["outcome"] = out.apply(
+        lambda row: str(row["metric"]) if row["metric"] == "Attendance" else f"{row['metric']} {row['subject']}",
+        axis=1,
+    )
     out["outcome"] = out["outcome"].str.strip()
     return out
 
