@@ -334,7 +334,8 @@ def first_last_pairs(df: pd.DataFrame, group_cols: list[str], metric: str, value
         return pd.DataFrame()
     rows = []
     for keys, group in df.groupby(group_cols):
-        group = group.dropna(subset=[value_col]).sort_values("time_order")
+        group = group[group[value_col].notna()].copy()
+        group = group.sort_values("time_order")
         if group["time_order"].nunique() < 2:
             continue
         first = group.iloc[0]
@@ -729,6 +730,16 @@ def loading_indicator():
                 ),
             ],
         ),
+    )
+
+
+def error_panel(message: str):
+    return html.Div(
+        className="insight-band",
+        children=[
+            html.H3("Dashboard load error"),
+            html.P(message),
+        ],
     )
 
 
@@ -1542,7 +1553,16 @@ def download_overview_snapshot(n_clicks, outcome, mode, group, subjects, years, 
     Input("student-filter", "value"),
 )
 def render(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
-    return cached_render_from_key(page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids))
+    try:
+        return cached_render_from_key(page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids))
+    except Exception as exc:
+        import traceback
+
+        print("Dashboard render error:", repr(exc))
+        traceback.print_exc()
+        return error_panel(
+            "The page could not be rendered on the server. Check the Render logs for the traceback, then I can fix the underlying data or callback error."
+        )
 
 
 if __name__ == "__main__":
