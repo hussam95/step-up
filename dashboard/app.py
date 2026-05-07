@@ -334,9 +334,8 @@ def first_last_pairs(df: pd.DataFrame, group_cols: list[str], metric: str, value
         return pd.DataFrame()
     rows = []
     for keys, group in df.groupby(group_cols):
-        group = group[group[value_col].notna()].copy()
-        group = group.sort_values("time_order")
-        if group["time_order"].nunique() < 2:
+        group = group.loc[group[value_col].notna()].sort_values("time_order")
+        if len(group) < 2:
             continue
         first = group.iloc[0]
         last = group.iloc[-1]
@@ -413,9 +412,14 @@ def overview_outcome_pairs(dfs) -> pd.DataFrame:
     return out
 
 
-@lru_cache(maxsize=1)
+_BASE_PAIRS: pd.DataFrame | None = None
+
+
 def base_pairs() -> pd.DataFrame:
-    return overview_outcome_pairs(DS)
+    global _BASE_PAIRS
+    if _BASE_PAIRS is None:
+        _BASE_PAIRS = overview_outcome_pairs(DS)
+    return _BASE_PAIRS
 
 
 @lru_cache(maxsize=128)
