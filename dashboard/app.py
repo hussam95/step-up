@@ -1,0 +1,1550 @@
+from __future__ import annotations
+
+import io
+import os
+from pathlib import Path
+from functools import lru_cache
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from dash import Dash, Input, Output, State, dcc, html
+from dash.exceptions import PreventUpdate
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "clean_data"
+
+GREEN = "#2f7d6d"
+GOLD = "#8a6f3d"
+BLUE = "#4067a8"
+RUST = "#b6573f"
+INK = "#20242a"
+TEMPLATE = "plotly_white"
+SEASON_ORDER = {"Fall": 1, "Winter": 2, "Spring": 3}
+STATUS_ORDER = ["Improved", "Regressed", "Stayed Same"]
+STATUS_COLORS = {"Improved": GREEN, "Regressed": RUST, "Stayed Same": BLUE}
+OUTCOME_OPTIONS = [
+    {"label": "STAR Reading", "value": "STAR Reading"},
+    {"label": "STAR Math", "value": "STAR Math"},
+    {"label": "CAASPP ELA", "value": "CAASPP ELA"},
+    {"label": "CAASPP Math", "value": "CAASPP Math"},
+    {"label": "Attendance", "value": "Attendance"},
+]
+
+
+def load_data() -> dict[str, pd.DataFrame]:
+    students = pd.read_csv(DATA / "students.csv")
+    star = pd.read_csv(DATA / "star_long.csv")
+    attendance = pd.read_csv(DATA / "attendance_long.csv")
+    caaspp = pd.read_csv(DATA / "caaspp_long.csv")
+    growth = pd.read_csv(DATA / "star_growth_pairs.csv")
+    availability = pd.read_csv(DATA / "availability_summary.csv")
+
+    for df in [students, star, attendance, caaspp, growth]:
+        df["student_id"] = df["student_id"].astype(str)
+
+    students["student_label"] = (
+        students["student_name"].fillna("Unknown").astype(str)
+        + " | "
+        + students["student_id"].astype(str)
+        + " | "
+        + students["school_current"].fillna("Unknown").astype(str)
+    )
+    return {
+        "students": students,
+        "star": star,
+        "attendance": attendance,
+        "caaspp": caaspp,
+        "growth": growth,
+        "availability": availability,
+    }
+
+
+DS = load_data()
+
+
+def opts(values):
+    vals = sorted([v for v in pd.Series(values).dropna().unique()])
+    return [{"label": str(v), "value": v} for v in vals]
+
+
+def opts_from_frame(df: pd.DataFrame, label_col: str, value_col: str):
+    if df.empty:
+        return []
+    return (
+        df[[label_col, value_col]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values(label_col)
+        .rename(columns={label_col: "label", value_col: "value"})
+        .to_dict("records")
+    )
+
+
+def keep_valid_values(values, options):
+    if values in (None, "", []):
+        return []
+    allowed = {str(option["value"]) for option in options}
+    kept = [value for value in values if str(value) in allowed]
+    return kept
+
+
+def normalize_values(values):
+    if values in (None, "", []):
+        return ()
+    if isinstance(values, (str, int, float, bool)):
+        return (values,)
+    return tuple(values)
+
+
+def cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    return (
+        mode,
+        group,
+        normalize_values(subjects),
+        normalize_values(years),
+        normalize_values(periods),
+        normalize_values(schools),
+        normalize_values(grades),
+        normalize_values(ethnicities),
+        normalize_values(intensities),
+        normalize_values(student_ids),
+    )
+
+
+def empty_fig(title: str, message: str = "No data for this selection."):
+    fig = go.Figure()
+    fig.add_annotation(text=message, x=0.5, y=0.5, showarrow=False, font={"size": 16})
+    fig.update_layout(template=TEMPLATE, title=title, xaxis={"visible": False}, yaxis={"visible": False})
+    return fig
+
+
+def polish(fig):
+    fig.update_layout(
+        template=TEMPLATE,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#ffffff",
+        margin={"l": 46, "r": 24, "t": 76, "b": 48},
+        title={"font": {"size": 19, "color": INK}, "x": 0.01, "xanchor": "left"},
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1,
+            "title": {"text": ""},
+            "font": {"size": 12},
+        },
+        hoverlabel={"bgcolor": "#ffffff", "bordercolor": "#d8e0ea", "font": {"size": 12}},
+        font={"family": "Inter, Segoe UI, Arial, sans-serif", "color": INK},
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, linecolor="#d8e0ea")
+    fig.update_yaxes(gridcolor="#edf1f5", zeroline=False, linecolor="#d8e0ea")
+    fig.for_each_annotation(lambda a: a.update(text=a.text.replace("subject=", "").replace("school_year=", "").replace("metric=", "")))
+    return fig
+
+
+def soften_axes(fig, x_title=None, y_title=None, hide_repeated_y=True):
+    if x_title is not None:
+        fig.update_xaxes(title_text=x_title)
+    if y_title is not None:
+        fig.update_yaxes(title_text=y_title)
+    if hide_repeated_y:
+        fig.for_each_yaxis(lambda axis: axis.update(title_text=""))
+        if y_title:
+            fig.update_yaxes(title_text=y_title, row=1, col=1)
+    fig.update_yaxes(title_standoff=8, automargin=True)
+    fig.update_xaxes(title_standoff=8, automargin=True)
+    return fig
+
+
+def kpi(label: str, value: str, note: str = ""):
+    return html.Div(
+        className="kpi-card",
+        children=[html.Div(label, className="kpi-label"), html.Div(value, className="kpi-value"), html.Div(note, className="kpi-note")],
+    )
+
+
+def nav():
+    links = [
+        ("/", "Overview"),
+        ("/star", "STAR Growth"),
+        ("/attendance-caaspp", "Attendance and CAASPP"),
+        ("/coverage", "Data Coverage"),
+    ]
+    return html.Div(
+        className="nav",
+        children=[
+            html.Div(className="brand", children=[html.Div("STEP UP", className="brand-title"), html.Div("Student Outcomes", className="brand-subtitle")]),
+            html.Div(className="nav-links", children=[dcc.Link(label, href=href, className="nav-link") for href, label in links]),
+        ],
+    )
+
+
+def filters():
+    students = DS["students"]
+    student_options = students.sort_values("student_label")[["student_label", "student_id"]].rename(
+        columns={"student_label": "label", "student_id": "value"}
+    )
+    return html.Div(
+        className="filters simple-filters",
+        children=[
+            html.Div(className="filter-control student-filter", children=[html.Label("Student / ID"), dcc.Dropdown(id="student-filter", options=student_options.to_dict("records"), value=[], multi=True, placeholder="Search name or District ID")]),
+            html.Div(className="filter-control compact-radio", children=[html.Label("Student set"), dcc.RadioItems(id="analysis-mode", options=[{"label": "All available", "value": "all"}, {"label": "Complete comparison", "value": "strict"}], value="all", inline=True)]),
+            html.Div(className="filter-control compact-radio", children=[html.Label("Group"), dcc.RadioItems(id="group-filter", options=[{"label": "All", "value": "all"}, {"label": "STEP UP", "value": "STEP UP"}, {"label": "Non-STEP UP", "value": "Non-STEP UP"}], value="all", inline=True)]),
+            html.Div(className="filter-control", children=[html.Label("Subject"), dcc.Dropdown(id="subject-filter", options=[{"label": "Reading", "value": "Reading"}, {"label": "Math", "value": "Math"}], value=["Reading", "Math"], multi=True)]),
+            html.Div(className="filter-control", children=[html.Label("Year"), dcc.Dropdown(id="year-filter", options=opts(DS["growth"]["school_year"]), value=[], multi=True, placeholder="All years")]),
+            html.Div(className="filter-control", children=[html.Label("STAR period"), dcc.Dropdown(id="period-filter", options=opts(DS["growth"]["period"]), value=[], multi=True, placeholder="All periods")]),
+            html.Div(className="filter-control", children=[html.Label("School"), dcc.Dropdown(id="school-filter", options=opts(students["school_group"]), value=[], multi=True, placeholder="All schools")]),
+            html.Div(className="filter-control", children=[html.Label("Grade"), dcc.Dropdown(id="grade-filter", options=opts(students["grade_current"].dropna().astype(int)), value=[], multi=True, placeholder="All grades")]),
+            html.Div(className="filter-control", children=[html.Label("Ethnicity"), dcc.Dropdown(id="ethnicity-filter", options=opts(students["ethnicity_group"]), value=[], multi=True, placeholder="All ethnicities")]),
+            html.Div(className="filter-control", children=[html.Label("Intensity"), dcc.Dropdown(id="intensity-filter", options=opts(students["intervention_intensity"]), value=[], multi=True, placeholder="All intensities")]),
+        ],
+    )
+
+
+def base_layout():
+    return html.Div(
+        [
+            dcc.Location(id="url"),
+            nav(),
+            html.Div(
+                className="app-shell",
+                children=[
+                    filters(),
+                    dcc.Loading(
+                        id="page-loading",
+                        className="app-loading",
+                        parent_className="app-loading-parent",
+                        children=html.Div(id="page"),
+                        type="dot",
+                        color="#2f7d6d",
+                        fullscreen=True,
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
+def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    out = df.copy()
+    if mode == "strict" and "strict_comparison_ready" in out.columns:
+        out = out[out["strict_comparison_ready"].astype(bool)]
+    if group != "all" and "student_group" in out.columns:
+        out = out[out["student_group"].eq(group)]
+    if subjects and "subject" in out.columns:
+        subject_values = set(subjects)
+        if "Reading" in subject_values:
+            subject_values.add("ELA")
+        out = out[out["subject"].isin(subject_values)]
+    if years:
+        if "school_year_display" in out.columns:
+            out = out[out["school_year_display"].isin(years)]
+        elif "school_year" in out.columns:
+            out = out[out["school_year"].isin(years)]
+    if periods and "period" in out.columns:
+        out = out[out["period"].isin(periods)]
+    if schools and "school_group" in out.columns:
+        out = out[out["school_group"].isin(schools)]
+    if grades and "grade_current" in out.columns:
+        out = out[out["grade_current"].isin(grades)]
+    if ethnicities and "ethnicity_group" in out.columns:
+        out = out[out["ethnicity_group"].isin(ethnicities)]
+    if intensities and "intervention_intensity" in out.columns:
+        out = out[out["intervention_intensity"].isin(intensities)]
+    if student_ids and "student_id" in out.columns:
+        out = out[out["student_id"].isin([str(x) for x in student_ids])]
+    return out
+
+
+@lru_cache(maxsize=128)
+def cached_filtered(*key):
+    mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids = key
+    students = filter_frame(DS["students"], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+    ids = set(students["student_id"])
+    return {
+        "students": students,
+        "star": filter_frame(DS["star"][DS["star"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
+        "attendance": filter_frame(DS["attendance"][DS["attendance"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
+        "caaspp": filter_frame(DS["caaspp"][DS["caaspp"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
+        "growth": filter_frame(DS["growth"][DS["growth"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
+    }
+
+
+def get_filtered(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    return cached_filtered(*cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids))
+
+
+def filtered_availability(dfs):
+    rows = []
+    star = dfs["star"]
+    attendance = dfs["attendance"]
+    caaspp = dfs["caaspp"]
+    if len(star):
+        grouped = (
+            star.groupby(["student_group", "school_year", "subject"])["student_id"]
+            .nunique()
+            .reset_index(name="students_available")
+        )
+        grouped["metric"] = "STAR"
+        grouped = grouped.rename(columns={"school_year": "year"})
+        rows.append(grouped[["student_group", "metric", "year", "subject", "students_available"]])
+    if len(attendance):
+        grouped = (
+            attendance.groupby(["student_group", "school_year"])["student_id"]
+            .nunique()
+            .reset_index(name="students_available")
+        )
+        grouped["metric"] = "Attendance"
+        grouped["subject"] = "Attendance"
+        grouped = grouped.rename(columns={"school_year": "year"})
+        rows.append(grouped[["student_group", "metric", "year", "subject", "students_available"]])
+    if len(caaspp):
+        grouped = (
+            caaspp.groupby(["student_group", "school_year_display", "subject"])["student_id"]
+            .nunique()
+            .reset_index(name="students_available")
+        )
+        grouped["metric"] = "CAASPP"
+        grouped = grouped.rename(columns={"school_year_display": "year"})
+        rows.append(grouped[["student_group", "metric", "year", "subject", "students_available"]])
+    if rows:
+        return pd.concat(rows, ignore_index=True)
+    return pd.DataFrame(columns=["student_group", "metric", "year", "subject", "students_available"])
+
+
+def star_time_label(df: pd.DataFrame) -> pd.Series:
+    return df["school_year"].astype(str) + " " + df["season"].astype(str)
+
+
+def ordered_star_points(star: pd.DataFrame) -> pd.DataFrame:
+    raw = star[star["value_type"].eq("score")].copy()
+    if raw.empty:
+        return raw
+    raw["season_order"] = raw["season"].map(SEASON_ORDER).fillna(9)
+    raw["time_order"] = raw["school_year"].str.slice(0, 4).astype(int) * 10 + raw["season_order"]
+    raw["time_label"] = star_time_label(raw)
+    return raw.sort_values(["student_id", "subject", "time_order"])
+
+
+def first_last_pairs(df: pd.DataFrame, group_cols: list[str], metric: str, value_col: str = "value") -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for keys, group in df.groupby(group_cols):
+        group = group.dropna(subset=[value_col]).sort_values("time_order")
+        if group["time_order"].nunique() < 2:
+            continue
+        first = group.iloc[0]
+        last = group.iloc[-1]
+        if first["time_order"] == last["time_order"]:
+            continue
+        key_values = keys if isinstance(keys, tuple) else (keys,)
+        row = dict(zip(group_cols, key_values))
+        row.update(
+            {
+                "metric": metric,
+                "subject": row.get("subject", metric),
+                "student_group": last.get("student_group", first.get("student_group")),
+                "student_name": last.get("student_name", first.get("student_name")),
+                "start_label": first.get("time_label", first.get("school_year", "")),
+                "end_label": last.get("time_label", last.get("school_year", "")),
+                "start_value": first[value_col],
+                "end_value": last[value_col],
+                "change": last[value_col] - first[value_col],
+            }
+        )
+        row["change_status"] = "Stayed Same"
+        if row["change"] > 0:
+            row["change_status"] = "Improved"
+        elif row["change"] < 0:
+            row["change_status"] = "Regressed"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def overview_outcome_pairs(dfs) -> pd.DataFrame:
+    pieces = []
+    star = ordered_star_points(dfs["star"])
+    if len(star):
+        pieces.append(first_last_pairs(star, ["student_id", "subject"], "STAR"))
+
+    caaspp = dfs["caaspp"].copy()
+    if len(caaspp):
+        caaspp["time_order"] = caaspp["school_year_display"].astype(str).str.slice(0, 4).astype(int)
+        caaspp["time_label"] = caaspp["school_year_display"]
+        pieces.append(first_last_pairs(caaspp, ["student_id", "subject"], "CAASPP"))
+
+    attendance = dfs["attendance"].copy()
+    if len(attendance):
+        attendance["measure_rank"] = attendance["measure"].map(
+            {"SIS Reported Rate": 0, "Attendance rate": 1, "Full Day Rate": 2}
+        ).fillna(9)
+        attendance = attendance.sort_values("measure_rank").drop_duplicates(
+            ["student_id", "school_year"], keep="first"
+        )
+        attendance["time_order"] = attendance["school_year"].astype(str).str.slice(0, 4).astype(int)
+        attendance["time_label"] = attendance["school_year"]
+        attendance["subject"] = "Attendance"
+        pieces.append(first_last_pairs(attendance, ["student_id", "subject"], "Attendance"))
+
+    if not pieces:
+        return pd.DataFrame(
+            columns=[
+                "student_id",
+                "metric",
+                "subject",
+                "student_group",
+                "student_name",
+                "start_label",
+                "end_label",
+                "start_value",
+                "end_value",
+                "change",
+                "change_status",
+            ]
+        )
+    out = pd.concat([p for p in pieces if len(p)], ignore_index=True)
+    out["outcome"] = out["metric"] + " " + out["subject"].where(out["metric"].ne("Attendance"), "")
+    out["outcome"] = out["outcome"].str.strip()
+    return out
+
+
+@lru_cache(maxsize=1)
+def base_pairs() -> pd.DataFrame:
+    return overview_outcome_pairs(DS)
+
+
+@lru_cache(maxsize=128)
+def cached_overview_outcome_pairs(*key):
+    dfs = get_filtered(*key)
+    return overview_outcome_pairs(dfs)
+
+
+def filter_pairs(pairs: pd.DataFrame, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    if pairs.empty:
+        return pairs
+    out = pairs
+    if group != "all":
+        out = out[out["student_group"].eq(group)]
+    if subjects:
+        subject_values = set(subjects)
+        if "Reading" in subject_values:
+            subject_values.add("ELA")
+        out = out[out["subject"].isin(subject_values) | ((out["metric"].eq("Attendance")) & ("Attendance" in subject_values))]
+    if years and "start_label" in out.columns:
+        year_values = set(years)
+        out = out[out["start_label"].astype(str).str[:7].isin(year_values) | out["end_label"].astype(str).str[:7].isin(year_values)]
+    if student_ids:
+        out = out[out["student_id"].isin([str(x) for x in student_ids])]
+    return out
+
+
+def outcome_kpi_value(pairs: pd.DataFrame, metric: str, subject: str | None = None, group: str | None = None) -> tuple[str, str]:
+    sub = pairs[pairs["metric"].eq(metric)]
+    if subject:
+        sub = sub[sub["subject"].eq(subject)]
+    if group:
+        sub = sub[sub["student_group"].eq(group)]
+    if sub.empty:
+        return "0%", "No paired students"
+    improved = int(sub["change_status"].eq("Improved").sum())
+    total = len(sub)
+    return f"{100 * improved / total:.1f}%", f"{improved:,} of {total:,} improved"
+
+
+def primary_story_group(students: pd.DataFrame, requested_group: str | None = None) -> str | None:
+    groups = set(students["student_group"].dropna())
+    if requested_group in {"STEP UP", "Non-STEP UP"} and requested_group in groups:
+        return requested_group
+    if "STEP UP" in groups:
+        return "STEP UP"
+    if len(groups) == 1:
+        return next(iter(groups))
+    return None
+
+
+def student_count_label(group: str | None, mode: str | None) -> tuple[str, str]:
+    mode_note = "complete comparison students" if mode == "strict" else "students matching filters"
+    if group == "STEP UP":
+        return "STEP UP students in view", mode_note
+    if group == "Non-STEP UP":
+        return "Non-STEP UP students in view", mode_note
+    return "Students in view", mode_note
+
+
+def clean_snapshot_rows(pairs: pd.DataFrame, outcome: str | None) -> pd.DataFrame:
+    if pairs.empty:
+        return pd.DataFrame()
+    selected = outcome or "STAR Reading"
+    out = pairs[pairs["outcome"].eq(selected)].copy()
+    out["change_display"] = out["change"].map(lambda x: f"{x:+.1f}")
+    out["start_value_display"] = out["start_value"].map(lambda x: f"{x:,.1f}")
+    out["end_value_display"] = out["end_value"].map(lambda x: f"{x:,.1f}")
+    return out.sort_values(["change_status", "change"], ascending=[True, False])
+
+
+def snapshot_table(df: pd.DataFrame) -> html.Div | html.Table:
+    if df.empty:
+        return html.Div(
+            className="insight-band",
+            children=[html.H3("No paired outcomes"), html.P("Select a broader group, year range, or outcome to show student-level changes.")],
+        )
+    cols = [
+        "student_name",
+        "student_group",
+        "outcome",
+        "start_label",
+        "end_label",
+        "start_value_display",
+        "end_value_display",
+        "change_display",
+        "change_status",
+    ]
+    labels = ["Student", "Group", "Outcome", "Start", "End", "Start Value", "End Value", "Change", "Status"]
+    rows = []
+    for _, row in df[cols].iterrows():
+        status_class = f"status-{str(row['change_status']).lower().replace(' ', '-')}"
+        rows.append(html.Tr([html.Td(str(row.get(c, ""))) for c in cols], className=status_class))
+    return html.Table(
+        className="data-table compact-table",
+        children=[html.Thead(html.Tr([html.Th(label) for label in labels])), html.Tbody(rows)],
+    )
+
+
+def filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids, outcome):
+    pairs = filter_pairs(base_pairs(), mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+    return clean_snapshot_rows(pairs, outcome)
+
+
+def page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    return (pathname,) + cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+
+
+@lru_cache(maxsize=64)
+def cached_render_from_key(key):
+    pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids = key
+    dfs = get_filtered(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+    if pathname == "/star":
+        return star_growth_page(dfs)
+    if pathname == "/comparison":
+        return comparison_page(dfs)
+    if pathname == "/attendance-caaspp":
+        return attendance_caaspp_page(dfs)
+    if pathname == "/students":
+        return student_page(dfs)
+    if pathname == "/coverage":
+        return coverage_page(dfs)
+    return overview(dfs, mode, group)
+
+
+def snapshot_excel_bytes(df: pd.DataFrame) -> bytes:
+    export = df[
+        [
+            "student_name",
+            "student_group",
+            "outcome",
+            "start_label",
+            "end_label",
+            "start_value",
+            "end_value",
+            "change",
+            "change_status",
+        ]
+    ].rename(
+        columns={
+            "student_name": "Student",
+            "student_group": "Group",
+            "outcome": "Outcome",
+            "start_label": "Start",
+            "end_label": "End",
+            "start_value": "Start Value",
+            "end_value": "End Value",
+            "change": "Change",
+            "change_status": "Status",
+        }
+    )
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Outcome Snapshot", index=False)
+        ws = writer.sheets["Outcome Snapshot"]
+        from openpyxl.styles import Font, PatternFill
+
+        fills = {
+            "Improved": PatternFill("solid", fgColor="DCEFE8"),
+            "Regressed": PatternFill("solid", fgColor="F8DEDA"),
+            "Stayed Same": PatternFill("solid", fgColor="E9EDF3"),
+        }
+        header_fill = PatternFill("solid", fgColor="12313F")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = Font(color="FFFFFF", bold=True)
+        status_col = list(export.columns).index("Status") + 1
+        for row_idx in range(2, ws.max_row + 1):
+            status = ws.cell(row_idx, status_col).value
+            fill = fills.get(status)
+            if fill:
+                for cell in ws[row_idx]:
+                    cell.fill = fill
+        for column_cells in ws.columns:
+            width = min(max(len(str(cell.value or "")) for cell in column_cells) + 2, 34)
+            ws.column_dimensions[column_cells[0].column_letter].width = width
+        ws.freeze_panes = "A2"
+    return output.getvalue()
+
+
+def outcome_direction_summary(pairs: pd.DataFrame) -> pd.DataFrame:
+    if pairs.empty:
+        return pd.DataFrame()
+    summary = (
+        pairs.groupby(["outcome", "student_group", "change_status"])
+        .size()
+        .reset_index(name="students")
+    )
+    totals = summary.groupby(["outcome", "student_group"])["students"].transform("sum")
+    summary["percent"] = 100 * summary["students"] / totals
+    return summary
+
+
+def star_trend_figure(star: pd.DataFrame, title: str):
+    raw = ordered_star_points(star)
+    if raw.empty:
+        return empty_fig(title)
+    trend = (
+        raw.groupby(["time_order", "time_label", "subject", "student_group"])["value"]
+        .mean()
+        .reset_index()
+        .sort_values("time_order")
+    )
+    fig = px.line(
+        trend,
+        x="time_label",
+        y="value",
+        color="student_group",
+        facet_col="subject",
+        markers=True,
+        title=title,
+        template=TEMPLATE,
+        color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+        labels={"time_label": "Time", "value": "Avg STAR", "student_group": "", "subject": "Subject"},
+    )
+    fig = polish(fig)
+    return soften_axes(fig, x_title="", y_title="Avg STAR")
+
+
+def availability_figures(dfs):
+    avail = filtered_availability(dfs)
+    if len(avail):
+        avail_plot = avail.copy()
+        avail_plot["measure_subject"] = avail_plot.apply(
+            lambda r: r["metric"] if r["metric"] == "Attendance" else f"{r['metric']} {r['subject']}",
+            axis=1,
+        )
+        fig_avail = px.bar(
+            avail_plot,
+            x="year",
+            y="students_available",
+            color="student_group",
+            facet_col="measure_subject",
+            facet_col_wrap=3,
+            barmode="group",
+            title="Students with available data by group, measure, and subject",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"year": "Year", "students_available": "Students with data", "student_group": "", "measure_subject": ""},
+        )
+        fig_avail.update_yaxes(matches=None)
+        fig_avail = soften_axes(polish(fig_avail), x_title="", y_title="Students")
+    else:
+        fig_avail = empty_fig("Students with available data")
+
+    star = dfs["star"]
+    if len(star):
+        star_summary = (
+            star.groupby(["school_year", "season", "subject", "student_group"])["student_id"]
+            .nunique()
+            .reset_index(name="students_available")
+        )
+        fig_star_avail = px.bar(
+            star_summary,
+            x="season",
+            y="students_available",
+            color="student_group",
+            facet_row="school_year",
+            facet_col="subject",
+            barmode="group",
+            category_orders={"season": ["Fall", "Winter", "Spring"]},
+            title="STAR availability by season: Reading and Math",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"season": "Season", "students_available": "Students with STAR data", "student_group": "", "subject": "Subject", "school_year": "Year"},
+        )
+        fig_star_avail.update_yaxes(matches=None)
+        fig_star_avail = soften_axes(polish(fig_star_avail), x_title="", y_title="Students")
+    else:
+        fig_star_avail = empty_fig("STAR availability by season")
+    return fig_star_avail, fig_avail
+
+
+def growth_kpis(growth: pd.DataFrame):
+    n = growth["student_id"].nunique()
+    if len(growth) == 0:
+        return html.Div(className="kpi-grid", children=[kpi("Students with start/end values", "0", "Selected STAR period")])
+    counts = growth["change_status"].value_counts()
+    improved = int(counts.get("Improved", 0))
+    regressed = int(counts.get("Regressed", 0))
+    same = int(counts.get("Stayed Same", 0))
+    total_pairs = improved + regressed + same
+    pct = lambda x: "0%" if total_pairs == 0 else f"{100*x/total_pairs:.1f}%"
+    return html.Div(
+        className="kpi-grid",
+        children=[
+            kpi("Students with start/end values", f"{n:,}", "Unique students in selected STAR comparison"),
+            kpi("Improved", pct(improved), f"{improved:,} student-period comparisons"),
+            kpi("Regressed", pct(regressed), f"{regressed:,} student-period comparisons"),
+            kpi("Stayed same", pct(same), f"{same:,} student-period comparisons"),
+        ],
+    )
+
+
+def page(title: str, subtitle: str, children):
+    return html.Div(className="page", children=[html.Div(className="page-header", children=[html.H1(title), html.P(subtitle)]), children])
+
+
+def loading_indicator():
+    return html.Div(
+        className="loading-overlay",
+        children=html.Div(
+            className="loading-card",
+            children=[
+                html.Div(className="loading-mark", children=[html.Span(), html.Span(), html.Span()]),
+                html.Div(
+                    className="loading-copy",
+                    children=[
+                        html.Div("Loading dashboard", className="loading-title"),
+                        html.Div("Refreshing tabs, filters, and records", className="loading-subtitle"),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+
+def overview(dfs, mode="all", requested_group="all"):
+    students = dfs["students"]
+    pairs = filter_pairs(base_pairs(), mode, requested_group, None, None, None, None, None, None, None, None)
+    story_group = primary_story_group(students, requested_group)
+    story_prefix = story_group if story_group else "Selected"
+    count_group = requested_group if requested_group in {"STEP UP", "Non-STEP UP"} else None
+    count_label, count_note = student_count_label(count_group, mode)
+    star_reading = outcome_kpi_value(pairs, "STAR", "Reading", story_group)
+    star_math = outcome_kpi_value(pairs, "STAR", "Math", story_group)
+    caaspp_ela = outcome_kpi_value(pairs, "CAASPP", "ELA", story_group)
+    caaspp_math = outcome_kpi_value(pairs, "CAASPP", "Math", story_group)
+    attendance = outcome_kpi_value(pairs, "Attendance", "Attendance", story_group)
+    cards = html.Div(
+        className="kpi-grid",
+        children=[
+            kpi(count_label, f"{len(students):,}", count_note),
+            kpi(f"{story_prefix} STAR Reading improved", star_reading[0], star_reading[1]),
+            kpi(f"{story_prefix} STAR Math improved", star_math[0], star_math[1]),
+            kpi(f"{story_prefix} Attendance improved", attendance[0], attendance[1]),
+            kpi(f"{story_prefix} CAASPP ELA improved", caaspp_ela[0], caaspp_ela[1]),
+            kpi(f"{story_prefix} CAASPP Math improved", caaspp_math[0], caaspp_math[1]),
+        ],
+    )
+
+    direction = outcome_direction_summary(pairs)
+    if len(direction):
+        fig_direction = px.bar(
+            direction,
+            x="outcome",
+            y="percent",
+            color="change_status",
+            facet_col="student_group",
+            barmode="stack",
+            category_orders={"change_status": STATUS_ORDER},
+            title="Outcome direction from earliest to latest available point",
+            template=TEMPLATE,
+            color_discrete_map=STATUS_COLORS,
+            labels={"outcome": "Outcome", "percent": "% of paired students", "change_status": "", "student_group": ""},
+            hover_data={"students": True, "percent": ":.1f"},
+        )
+        fig_direction.update_yaxes(range=[0, 100])
+        fig_direction = soften_axes(polish(fig_direction), x_title="", y_title="% students")
+    else:
+        fig_direction = empty_fig("Outcome direction from earliest to latest available point")
+
+    fig_star_story = star_trend_figure(dfs["star"], "STAR score journey over available seasons")
+
+    caaspp = dfs["caaspp"]
+    if len(caaspp):
+        ca_trend = caaspp.groupby(["school_year_display", "subject", "student_group"])["value"].mean().reset_index()
+        fig_ca = px.line(
+            ca_trend,
+            x="school_year_display",
+            y="value",
+            color="student_group",
+            facet_col="subject",
+            markers=True,
+            title="CAASPP movement where two years are available",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"school_year_display": "Year", "value": "Avg CAASPP", "student_group": "", "subject": "Subject"},
+        )
+        fig_ca = soften_axes(polish(fig_ca), x_title="", y_title="Avg CAASPP")
+    else:
+        fig_ca = empty_fig("CAASPP movement where two years are available")
+
+    att = dfs["attendance"]
+    if len(att):
+        att = att.copy()
+        att["measure_rank"] = att["measure"].map({"SIS Reported Rate": 0, "Attendance rate": 1, "Full Day Rate": 2}).fillna(9)
+        att = att.sort_values("measure_rank").drop_duplicates(["student_id", "school_year"], keep="first")
+        att_year = (
+            att.groupby(["school_year", "student_group"])["value"]
+            .mean()
+            .reset_index()
+        )
+        fig_att = px.line(
+            att_year,
+            x="school_year",
+            y="value",
+            color="student_group",
+            markers=True,
+            title="Attendance movement across available years",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"school_year": "Year", "value": "Avg attendance", "student_group": ""},
+        )
+        fig_att.update_yaxes(range=[0, 100])
+        fig_att = soften_axes(polish(fig_att), x_title="", y_title="Avg attendance", hide_repeated_y=False)
+    else:
+        fig_att = empty_fig("Attendance movement across available years")
+
+    note = html.Div(
+        className="insight-band",
+        children=[
+            html.H3("How to read this page"),
+            html.P("Overview comparisons use each student's earliest and latest selected point for STAR, CAASPP, and attendance. Seasonal STAR detail and raw data availability live on the STAR Growth and Data Coverage tabs."),
+        ],
+    )
+    return page(
+        "STEP UP Student Story",
+        "Earliest-to-latest movement across STAR, CAASPP, and attendance, with STEP UP students kept in view even when some metrics are missing.",
+        html.Div(
+            [
+                cards,
+                note,
+                dcc.Graph(figure=fig_direction, className="chart wide"),
+                dcc.Graph(figure=fig_star_story, className="chart wide"),
+                html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)]),
+                html.Div(
+                    className="section-toolbar",
+                    children=[
+                        html.H2("Student-level outcome snapshot"),
+                        html.Div(
+                            className="snapshot-actions",
+                            children=[
+                                dcc.Dropdown(id="overview-outcome-filter", options=OUTCOME_OPTIONS, value="STAR Reading", clearable=False),
+                                html.Button("Download Excel", id="download-snapshot-button", className="download-button", n_clicks=0),
+                                dcc.Download(id="download-snapshot"),
+                            ],
+                        ),
+                    ],
+                ),
+                html.Div(id="overview-snapshot-table", className="table-scroll"),
+            ]
+        ),
+    )
+
+
+def star_growth_page(dfs):
+    star, growth = dfs["star"], dfs["growth"]
+    star_pairs = overview_outcome_pairs({**dfs, "attendance": dfs["attendance"].iloc[0:0], "caaspp": dfs["caaspp"].iloc[0:0]})
+    star_pairs = star_pairs[star_pairs["metric"].eq("STAR")]
+    story_group = primary_story_group(dfs["students"])
+    reading = outcome_kpi_value(star_pairs, "STAR", "Reading", story_group)
+    math = outcome_kpi_value(star_pairs, "STAR", "Math", story_group)
+    paired_students = star_pairs["student_id"].nunique() if len(star_pairs) else 0
+
+    if len(growth):
+        period_status = (
+            growth.groupby(["student_group", "subject", "period", "change_status"])
+            .size()
+            .reset_index(name="students")
+        )
+        period_status["total"] = period_status.groupby(["student_group", "subject", "period"])["students"].transform("sum")
+        period_status["percent"] = 100 * period_status["students"] / period_status["total"]
+        improved_periods = period_status[period_status["change_status"].eq("Improved")].copy()
+        if len(improved_periods):
+            best = improved_periods.sort_values("percent", ascending=False).iloc[0]
+            best_note = f"{best['student_group']} {best['subject']} {best['period']}"
+            best_value = f"{best['percent']:.1f}%"
+        else:
+            best_value, best_note = "0%", "No improved period"
+
+        fig_period = px.bar(
+            period_status,
+            x="period",
+            y="percent",
+            color="change_status",
+            facet_row="student_group",
+            facet_col="subject",
+            barmode="stack",
+            category_orders={"change_status": STATUS_ORDER},
+            title="Where STAR students improved, regressed, or stayed flat",
+            template=TEMPLATE,
+            color_discrete_map=STATUS_COLORS,
+            labels={"period": "STAR period", "percent": "% of paired students", "change_status": "", "student_group": "", "subject": ""},
+            hover_data={"students": True, "percent": ":.1f"},
+        )
+        fig_period.update_yaxes(range=[0, 100], matches=None)
+        fig_period = soften_axes(polish(fig_period), x_title="", y_title="% students")
+
+        fig_dist = px.box(
+            growth,
+            x="period",
+            y="change",
+            color="student_group",
+            facet_col="subject",
+            points=False,
+            title="Distribution of STAR score changes by period",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"period": "STAR period", "change": "Score change", "student_group": "", "subject": ""},
+        )
+        fig_dist = soften_axes(polish(fig_dist), x_title="", y_title="Score change")
+
+        avg_change = growth.groupby(["student_group", "school_year", "subject", "period"])["change"].mean().reset_index()
+        fig_avg = px.bar(
+            avg_change,
+            x="period",
+            y="change",
+            color="student_group",
+            facet_row="school_year",
+            facet_col="subject",
+            barmode="group",
+            title="Average STAR change by year and period",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"period": "STAR period", "change": "Avg change", "student_group": "", "school_year": "Year", "subject": ""},
+        )
+        fig_avg.update_yaxes(matches=None)
+        fig_avg = soften_axes(polish(fig_avg), x_title="", y_title="Avg change")
+    else:
+        best_value, best_note = "0%", "No STAR period pairs"
+        fig_period = empty_fig("Where STAR students improved, regressed, or stayed flat")
+        fig_dist = empty_fig("Distribution of STAR score changes by period")
+        fig_avg = empty_fig("Average STAR change by year and period")
+
+    if len(star_pairs):
+        table_df = star_pairs.copy()
+        table_df["change_display"] = table_df["change"].map(lambda x: f"{x:+.1f}")
+        table_df["start_value_display"] = table_df["start_value"].map(lambda x: f"{x:,.1f}")
+        table_df["end_value_display"] = table_df["end_value"].map(lambda x: f"{x:,.1f}")
+        table_df = table_df.sort_values(["change_status", "change"], ascending=[True, False])
+        table = snapshot_table(table_df)
+    else:
+        table = snapshot_table(pd.DataFrame())
+
+    cards = html.Div(
+        className="kpi-grid",
+        children=[
+            kpi("Students with STAR pairs", f"{paired_students:,}", "Earliest-to-latest STAR records"),
+            kpi("STAR Reading improved", reading[0], reading[1]),
+            kpi("STAR Math improved", math[0], math[1]),
+            kpi("Strongest improvement period", best_value, best_note),
+        ],
+    )
+    note = html.Div(
+        className="insight-band",
+        children=[
+            html.H3("What this page adds"),
+            html.P("The overview shows the headline STAR direction. This page breaks that direction into specific STAR periods, shows the spread of student changes, and identifies which periods are carrying the gains."),
+        ],
+    )
+    return page(
+        "STAR Growth",
+        "Period-by-period STAR growth details behind the overview story.",
+        html.Div([cards, note, dcc.Graph(figure=fig_period, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_dist), dcc.Graph(figure=fig_avg)]), html.H2("STAR student change details"), html.Div(table, className="table-scroll")]),
+    )
+
+
+def comparison_page(dfs):
+    star, caaspp, attendance = dfs["star"], dfs["caaspp"], dfs["attendance"]
+    star_use = star[star["value_type"].isin(["score", "benchmark_numeric"])]
+    if len(star_use):
+        star_summary = star_use.groupby(["student_group", "school_year", "subject"])["value"].mean().reset_index()
+        fig_star = px.bar(
+            star_summary,
+            x="school_year",
+            y="value",
+            color="student_group",
+            facet_col="subject",
+            barmode="group",
+            title="Average STAR by group",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"school_year": "Year", "value": "Average STAR value", "student_group": "", "subject": "Subject"},
+        )
+        fig_star = polish(fig_star)
+        fig_star = soften_axes(fig_star, x_title="", y_title="Avg STAR")
+    else:
+        fig_star = empty_fig("Average STAR by group")
+    if len(caaspp):
+        ca_summary = caaspp.groupby(["student_group", "school_year_display", "subject"])["value"].mean().reset_index()
+        fig_ca = px.bar(
+            ca_summary,
+            x="school_year_display",
+            y="value",
+            color="student_group",
+            facet_col="subject",
+            barmode="group",
+            title="Average CAASPP by group",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"school_year_display": "Year", "value": "Average CAASPP score", "student_group": "", "subject": "Subject"},
+        )
+        fig_ca = polish(fig_ca)
+        fig_ca = soften_axes(fig_ca, x_title="", y_title="Avg CAASPP")
+    else:
+        fig_ca = empty_fig("Average CAASPP by group")
+    if len(attendance):
+        att_summary = attendance.groupby(["student_group", "school_year"])["value"].mean().reset_index()
+        fig_att = px.bar(
+            att_summary,
+            x="school_year",
+            y="value",
+            color="student_group",
+            barmode="group",
+            title="Average attendance by group",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"school_year": "Year", "value": "Average attendance rate", "student_group": ""},
+        )
+        fig_att.update_yaxes(range=[0, 100])
+        fig_att = polish(fig_att)
+        fig_att = soften_axes(fig_att, x_title="", y_title="Avg attendance", hide_repeated_y=False)
+    else:
+        fig_att = empty_fig("Average attendance by group")
+    return page("STEP UP vs Non-STEP UP", "Use all available data or switch to strict comparable data in the Mode filter.", html.Div([dcc.Graph(figure=fig_star, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)])]))
+
+
+def attendance_caaspp_page(dfs):
+    attendance, caaspp = dfs["attendance"], dfs["caaspp"]
+    pairs = overview_outcome_pairs(dfs)
+    pairs = pairs[pairs["metric"].isin(["CAASPP", "Attendance"])]
+    story_group = primary_story_group(dfs["students"])
+    ca_ela = outcome_kpi_value(pairs, "CAASPP", "ELA", story_group)
+    ca_math = outcome_kpi_value(pairs, "CAASPP", "Math", story_group)
+    att_kpi = outcome_kpi_value(pairs, "Attendance", "Attendance", story_group)
+    paired_students = pairs["student_id"].nunique() if len(pairs) else 0
+
+    direction = outcome_direction_summary(pairs)
+    if len(direction):
+        fig_direction = px.bar(
+            direction,
+            x="outcome",
+            y="percent",
+            color="change_status",
+            facet_col="student_group",
+            barmode="stack",
+            category_orders={"change_status": STATUS_ORDER},
+            title="Annual outcome direction for CAASPP and attendance",
+            template=TEMPLATE,
+            color_discrete_map=STATUS_COLORS,
+            labels={"outcome": "Outcome", "percent": "% of paired students", "change_status": "", "student_group": ""},
+            hover_data={"students": True, "percent": ":.1f"},
+        )
+        fig_direction.update_yaxes(range=[0, 100])
+        fig_direction = soften_axes(polish(fig_direction), x_title="", y_title="% students")
+    else:
+        fig_direction = empty_fig("Annual outcome direction for CAASPP and attendance")
+
+    ca_pairs = pairs[pairs["metric"].eq("CAASPP")]
+    if len(ca_pairs):
+        fig_ca_change = px.box(
+            ca_pairs,
+            x="subject",
+            y="change",
+            color="student_group",
+            points=False,
+            title="Distribution of CAASPP score change",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"subject": "CAASPP subject", "change": "Score change", "student_group": ""},
+        )
+        fig_ca_change = soften_axes(polish(fig_ca_change), x_title="", y_title="Score change", hide_repeated_y=False)
+
+        ca_start_end = ca_pairs.melt(
+            id_vars=["student_id", "student_group", "subject"],
+            value_vars=["start_value", "end_value"],
+            var_name="point",
+            value_name="score",
+        )
+        ca_start_end["point"] = ca_start_end["point"].map({"start_value": "Start", "end_value": "End"})
+        ca_line = ca_start_end.groupby(["student_group", "subject", "point"])["score"].mean().reset_index()
+        fig_ca_level = px.line(
+            ca_line,
+            x="point",
+            y="score",
+            color="student_group",
+            facet_col="subject",
+            markers=True,
+            title="Average CAASPP start-to-end movement",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"point": "", "score": "Avg score", "student_group": "", "subject": ""},
+        )
+        fig_ca_level = soften_axes(polish(fig_ca_level), x_title="", y_title="Avg CAASPP")
+    else:
+        fig_ca_change = empty_fig("Distribution of CAASPP score change")
+        fig_ca_level = empty_fig("Average CAASPP start-to-end movement")
+
+    att_pairs = pairs[pairs["metric"].eq("Attendance")]
+    if len(att_pairs):
+        fig_att_change = px.box(
+            att_pairs,
+            x="student_group",
+            y="change",
+            color="student_group",
+            points=False,
+            title="Distribution of attendance-rate change",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"student_group": "", "change": "Attendance point change"},
+        )
+        fig_att_change = soften_axes(polish(fig_att_change), x_title="", y_title="Point change", hide_repeated_y=False)
+    else:
+        fig_att_change = empty_fig("Distribution of attendance-rate change")
+
+    relationship = pd.DataFrame()
+    if len(att_pairs) and len(ca_pairs):
+        ca_avg = ca_pairs.groupby(["student_id", "student_group", "student_name"], as_index=False)["change"].mean().rename(columns={"change": "caaspp_change"})
+        att_avg = att_pairs[["student_id", "change"]].rename(columns={"change": "attendance_change"})
+        relationship = ca_avg.merge(att_avg, on="student_id", how="inner")
+    if len(relationship):
+        fig_relation = px.scatter(
+            relationship,
+            x="attendance_change",
+            y="caaspp_change",
+            color="student_group",
+            hover_data=["student_name"],
+            title="Do attendance gains move with CAASPP gains?",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"attendance_change": "Attendance point change", "caaspp_change": "Avg CAASPP score change", "student_group": ""},
+        )
+        fig_relation.add_hline(y=0, line_dash="dot", line_color="#9aa6b2")
+        fig_relation.add_vline(x=0, line_dash="dot", line_color="#9aa6b2")
+        fig_relation = soften_axes(polish(fig_relation), x_title="Attendance point change", y_title="Avg CAASPP change", hide_repeated_y=False)
+    else:
+        fig_relation = empty_fig("Do attendance gains move with CAASPP gains?")
+
+    if len(pairs):
+        table_df = pairs.copy()
+        table_df["change_display"] = table_df["change"].map(lambda x: f"{x:+.1f}")
+        table_df["start_value_display"] = table_df["start_value"].map(lambda x: f"{x:,.1f}")
+        table_df["end_value_display"] = table_df["end_value"].map(lambda x: f"{x:,.1f}")
+        table = snapshot_table(table_df.sort_values(["outcome", "change"], ascending=[True, False]))
+    else:
+        table = snapshot_table(pd.DataFrame())
+
+    cards = html.Div(
+        className="kpi-grid",
+        children=[
+            kpi("Students with annual pairs", f"{paired_students:,}", "CAASPP or attendance start/end values"),
+            kpi("CAASPP ELA improved", ca_ela[0], ca_ela[1]),
+            kpi("CAASPP Math improved", ca_math[0], ca_math[1]),
+            kpi("Attendance improved", att_kpi[0], att_kpi[1]),
+        ],
+    )
+    note = html.Div(
+        className="insight-band",
+        children=[
+            html.H3("What this page adds"),
+            html.P("The overview states the headline direction. This page separates CAASPP from attendance, shows the spread of annual changes, and tests whether attendance movement and CAASPP movement are traveling together for the same students."),
+        ],
+    )
+    return page(
+        "CAASPP and Attendance",
+        "Annual assessment and attendance movement behind the overview story.",
+        html.Div([cards, note, dcc.Graph(figure=fig_direction, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca_change), dcc.Graph(figure=fig_att_change)]), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca_level), dcc.Graph(figure=fig_relation)]), html.H2("CAASPP and attendance student change details"), html.Div(table, className="table-scroll")]),
+    )
+
+
+def student_page(dfs):
+    students, star, caaspp, attendance = dfs["students"], dfs["star"], dfs["caaspp"], dfs["attendance"]
+    star_plot = star.copy()
+    if len(star_plot):
+        star_plot["period_label"] = star_plot["school_year"] + " " + star_plot["season"]
+        fig_star = px.line(
+            star_plot,
+            x="period_label",
+            y="value",
+            color="subject",
+            line_group="student_id",
+            markers=True,
+            hover_data=["student_name", "student_id", "student_group"],
+            title="Student STAR trajectory",
+            template=TEMPLATE,
+            color_discrete_map={"Reading": BLUE, "Math": GREEN},
+            labels={"period_label": "Year and season", "value": "STAR value", "subject": ""},
+        )
+        fig_star = polish(fig_star)
+        fig_star = soften_axes(fig_star, x_title="", y_title="STAR value", hide_repeated_y=False)
+    else:
+        fig_star = empty_fig("Student STAR trajectory")
+    if len(caaspp):
+        fig_ca = px.bar(
+            caaspp,
+            x="school_year_display",
+            y="value",
+            color="subject",
+            barmode="group",
+            hover_data=["student_name", "student_id", "student_group"],
+            title="Student CAASPP records",
+            template=TEMPLATE,
+            labels={"school_year_display": "Year", "value": "CAASPP score", "subject": ""},
+        )
+        fig_ca = polish(fig_ca)
+        fig_ca = soften_axes(fig_ca, x_title="", y_title="CAASPP score", hide_repeated_y=False)
+    else:
+        fig_ca = empty_fig("Student CAASPP records")
+    if len(attendance):
+        fig_att = px.bar(
+            attendance,
+            x="school_year",
+            y="value",
+            color="measure",
+            hover_data=["student_name", "student_id", "student_group"],
+            title="Student attendance records",
+            template=TEMPLATE,
+            labels={"school_year": "Year", "value": "Attendance rate", "measure": ""},
+        )
+        fig_att.update_yaxes(range=[0, 100])
+        fig_att = polish(fig_att)
+        fig_att = soften_axes(fig_att, x_title="", y_title="Attendance", hide_repeated_y=False)
+    else:
+        fig_att = empty_fig("Student attendance records")
+    cols = ["student_id", "student_name", "student_group", "school_current", "grade_current", "ethnicity_group", "stepup_exposure_level", "intervention_intensity"]
+    table = html.Table(
+        className="data-table",
+        children=[
+            html.Thead(html.Tr([html.Th(c.replace("_", " ").title()) for c in cols])),
+            html.Tbody([html.Tr([html.Td(str(row.get(c, ""))) for c in cols]) for _, row in students[cols].head(60).iterrows()]),
+        ],
+    )
+    return page("Student Drilldown", "Search one or more students above to inspect the records we have for them.", html.Div([dcc.Graph(figure=fig_star, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)]), html.H2("Students in selection"), table]))
+
+
+def coverage_page(dfs):
+    students = dfs["students"]
+    total_students = students["student_id"].nunique()
+    step_students = students.loc[students["student_group"].eq("STEP UP"), "student_id"].nunique()
+    non_students = students.loc[students["student_group"].eq("Non-STEP UP"), "student_id"].nunique()
+    complete_students = int(students["strict_comparison_ready"].sum()) if "strict_comparison_ready" in students else 0
+
+    availability_rows = []
+    star = dfs["star"]
+    if len(star):
+        star_counts = star.groupby(["student_group", "school_year", "season", "subject"])["student_id"].nunique().reset_index(name="students")
+        for _, row in star_counts.iterrows():
+            availability_rows.append(
+                {
+                    "Metric": "STAR",
+                    "Year": row["school_year"],
+                    "Session": row["season"],
+                    "Subject": row["subject"],
+                    "Group": row["student_group"],
+                    "Students": int(row["students"]),
+                    "Confidence": "High",
+                }
+            )
+    caaspp = dfs["caaspp"]
+    if len(caaspp):
+        ca_counts = caaspp.groupby(["student_group", "school_year_display", "subject"])["student_id"].nunique().reset_index(name="students")
+        for _, row in ca_counts.iterrows():
+            confidence = "Medium" if str(row["school_year_display"]) == "2023-24" else "High"
+            availability_rows.append(
+                {
+                    "Metric": "CAASPP",
+                    "Year": row["school_year_display"],
+                    "Session": "Yearly",
+                    "Subject": row["subject"],
+                    "Group": row["student_group"],
+                    "Students": int(row["students"]),
+                    "Confidence": confidence,
+                }
+            )
+    attendance = dfs["attendance"]
+    if len(attendance):
+        att_counts = attendance.groupby(["student_group", "school_year"])["student_id"].nunique().reset_index(name="students")
+        for _, row in att_counts.iterrows():
+            confidence = "High" if str(row["school_year"]) == "2024-25" else "Medium"
+            availability_rows.append(
+                {
+                    "Metric": "Attendance",
+                    "Year": row["school_year"],
+                    "Session": "Annual",
+                    "Subject": "Attendance",
+                    "Group": row["student_group"],
+                    "Students": int(row["students"]),
+                    "Confidence": confidence,
+                }
+            )
+    matrix = pd.DataFrame(availability_rows)
+    if len(matrix):
+        matrix["Coverage"] = matrix["Metric"] + " | " + matrix["Subject"] + " | " + matrix["Year"] + " | " + matrix["Session"]
+        fig_matrix = px.bar(
+            matrix,
+            x="Students",
+            y="Coverage",
+            color="Group",
+            barmode="group",
+            orientation="h",
+            title="Coverage matrix: metric, year, session, and student group",
+            template=TEMPLATE,
+            color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            labels={"Students": "Students with data", "Coverage": "", "Group": ""},
+            hover_data=["Confidence"],
+        )
+        fig_matrix.update_layout(height=max(520, min(1050, 26 * matrix["Coverage"].nunique() + 140)))
+        fig_matrix = polish(fig_matrix)
+        fig_matrix = soften_axes(fig_matrix, x_title="Students", y_title="", hide_repeated_y=False)
+    else:
+        fig_matrix = empty_fig("Coverage matrix")
+
+    expected = []
+    for metric, years, sessions, subjects in [
+        ("STAR", ["2022-23", "2023-24", "2024-25"], ["Fall", "Winter", "Spring"], ["Reading", "Math"]),
+        ("CAASPP", ["2022-23", "2023-24", "2024-25"], ["Yearly"], ["ELA", "Math"]),
+        ("Attendance", ["2022-23", "2023-24", "2024-25"], ["Annual"], ["Attendance"]),
+    ]:
+        for year in years:
+            for session in sessions:
+                for subject in subjects:
+                    expected.append({"Metric": metric, "Year": year, "Session": session, "Subject": subject})
+    expected_df = pd.DataFrame(expected)
+    present = matrix.groupby(["Metric", "Year", "Session", "Subject"])["Students"].sum().reset_index() if len(matrix) else pd.DataFrame(columns=["Metric", "Year", "Session", "Subject", "Students"])
+    present["Status"] = "Present"
+    gap = expected_df.merge(present, on=["Metric", "Year", "Session", "Subject"], how="left")
+    gap["Status"] = gap["Status"].fillna("Missing")
+    gap["Students"] = gap["Students"].fillna(0).astype(int)
+    gap["Field"] = gap["Metric"] + " | " + gap["Subject"] + " | " + gap["Session"]
+    fig_gap = px.bar(
+        gap,
+        x="Year",
+        y="Field",
+        color="Status",
+        orientation="h",
+        title="Present vs missing data slots",
+        template=TEMPLATE,
+        color_discrete_map={"Present": GREEN, "Missing": "#c9d1da"},
+        labels={"Year": "Year", "Field": "", "Status": ""},
+        hover_data={"Students": True},
+    )
+    fig_gap = polish(fig_gap)
+    fig_gap = soften_axes(fig_gap, x_title="", y_title="", hide_repeated_y=False)
+
+    table_df = matrix.sort_values(["Metric", "Year", "Session", "Subject", "Group"]) if len(matrix) else matrix
+    table = html.Table(
+        className="data-table compact-table",
+        children=[
+            html.Thead(html.Tr([html.Th(c) for c in ["Metric", "Year", "Session", "Subject", "Group", "Students", "Confidence"]])),
+            html.Tbody(
+                [
+                    html.Tr([html.Td(str(row.get(c, ""))) for c in ["Metric", "Year", "Session", "Subject", "Group", "Students", "Confidence"]])
+                    for _, row in table_df.iterrows()
+                ]
+            ),
+        ],
+    )
+    fig_star_avail, fig_avail = availability_figures(dfs)
+    cards = html.Div(
+        className="kpi-grid",
+        children=[
+            kpi("Students in selection", f"{total_students:,}", "Current filters"),
+            kpi("STEP UP students", f"{step_students:,}", "Data-file STEP UP evidence"),
+            kpi("Non-STEP UP students", f"{non_students:,}", "No STEP UP evidence"),
+            kpi("Complete comparison students", f"{complete_students:,}", "All core fields available"),
+        ],
+    )
+    note = html.Div(
+        className="insight-band",
+        children=[
+            html.H3("How to read coverage"),
+            html.P("This page is only about data availability. STAR is shown by year, season, and subject. CAASPP is yearly by subject. Attendance is annual. Medium-confidence fields are usable but have inferred-year context documented in the data notes."),
+        ],
+    )
+    return page(
+        "Data Coverage",
+        "Which STAR, CAASPP, and attendance fields are present or missing by year, session, subject, and student group.",
+        html.Div(
+            [
+                cards,
+                note,
+                dcc.Graph(figure=fig_gap, className="chart wide"),
+                dcc.Graph(figure=fig_matrix, className="chart wide"),
+                dcc.Graph(figure=fig_star_avail, className="chart wide"),
+                dcc.Graph(figure=fig_avail, className="chart wide"),
+                html.H2("Coverage detail"),
+                html.Div(table, className="table-scroll"),
+            ]
+        ),
+    )
+
+
+app = Dash(__name__, suppress_callback_exceptions=True, title="STEP UP Student Outcomes")
+server = app.server
+app.layout = base_layout
+
+
+@app.callback(
+    Output("student-filter", "options"),
+    Output("subject-filter", "options"),
+    Output("year-filter", "options"),
+    Output("period-filter", "options"),
+    Output("school-filter", "options"),
+    Output("grade-filter", "options"),
+    Output("ethnicity-filter", "options"),
+    Output("intensity-filter", "options"),
+    Input("analysis-mode", "value"),
+    Input("group-filter", "value"),
+    Input("subject-filter", "value"),
+    Input("year-filter", "value"),
+    Input("period-filter", "value"),
+    Input("school-filter", "value"),
+    Input("grade-filter", "value"),
+    Input("ethnicity-filter", "value"),
+    Input("intensity-filter", "value"),
+    Input("student-filter", "value"),
+)
+def cascade_filter_options(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    students = DS["students"].copy()
+    if mode == "strict":
+        students = students[students["strict_comparison_ready"].astype(bool)]
+    if group != "all":
+        students = students[students["student_group"].eq(group)]
+    if student_ids:
+        students = students[students["student_id"].isin([str(x) for x in student_ids])]
+    if schools:
+        students = students[students["school_group"].isin(schools)]
+    if grades:
+        students = students[students["grade_current"].isin(grades)]
+    if ethnicities:
+        students = students[students["ethnicity_group"].isin(ethnicities)]
+    if intensities:
+        students = students[students["intervention_intensity"].isin(intensities)]
+
+    ids = set(students["student_id"])
+    star = DS["star"][DS["star"]["student_id"].isin(ids)]
+    growth = DS["growth"][DS["growth"]["student_id"].isin(ids)]
+    caaspp = DS["caaspp"][DS["caaspp"]["student_id"].isin(ids)]
+    subject_context = pd.concat(
+        [star["subject"], caaspp["subject"].replace({"ELA": "Reading"})],
+        ignore_index=True,
+    )
+    if subjects:
+        star = star[star["subject"].isin(subjects)]
+        growth = growth[growth["subject"].isin(subjects)]
+        ca_subjects = set(subjects)
+        if "Reading" in ca_subjects:
+            ca_subjects.add("ELA")
+        caaspp = caaspp[caaspp["subject"].isin(ca_subjects)]
+    if years:
+        star = star[star["school_year"].isin(years)]
+        growth = growth[growth["school_year"].isin(years)]
+        caaspp = caaspp[caaspp["school_year_display"].isin(years)]
+    if periods:
+        growth = growth[growth["period"].isin(periods)]
+
+    student_options = opts_from_frame(students.sort_values("student_label"), "student_label", "student_id")
+    subject_options = opts(subject_context[subject_context.isin(["Reading", "Math"])])
+    year_values = pd.concat(
+        [
+            star["school_year"],
+            growth["school_year"],
+            caaspp["school_year_display"],
+            DS["attendance"][DS["attendance"]["student_id"].isin(ids)]["school_year"],
+        ],
+        ignore_index=True,
+    )
+    year_options = opts(year_values)
+    period_options = opts(growth["period"])
+    school_options = opts(students["school_group"])
+    grade_options = opts(students["grade_current"].dropna().astype(int))
+    ethnicity_options = opts(students["ethnicity_group"])
+    intensity_options = opts(students["intervention_intensity"])
+    return student_options, subject_options, year_options, period_options, school_options, grade_options, ethnicity_options, intensity_options
+
+
+@app.callback(
+    Output("overview-snapshot-table", "children"),
+    Input("overview-outcome-filter", "value"),
+    Input("analysis-mode", "value"),
+    Input("group-filter", "value"),
+    Input("subject-filter", "value"),
+    Input("year-filter", "value"),
+    Input("period-filter", "value"),
+    Input("school-filter", "value"),
+    Input("grade-filter", "value"),
+    Input("ethnicity-filter", "value"),
+    Input("intensity-filter", "value"),
+    Input("student-filter", "value"),
+)
+def update_overview_snapshot(outcome, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    df = filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids, outcome)
+    return snapshot_table(df)
+
+
+@app.callback(
+    Output("download-snapshot", "data"),
+    Input("download-snapshot-button", "n_clicks"),
+    State("overview-outcome-filter", "value"),
+    State("analysis-mode", "value"),
+    State("group-filter", "value"),
+    State("subject-filter", "value"),
+    State("year-filter", "value"),
+    State("period-filter", "value"),
+    State("school-filter", "value"),
+    State("grade-filter", "value"),
+    State("ethnicity-filter", "value"),
+    State("intensity-filter", "value"),
+    State("student-filter", "value"),
+    prevent_initial_call=True,
+)
+def download_overview_snapshot(n_clicks, outcome, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    if not n_clicks:
+        raise PreventUpdate
+    df = filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids, outcome)
+    if df.empty:
+        raise PreventUpdate
+    filename = f"student_outcome_snapshot_{str(outcome or 'outcome').lower().replace(' ', '_')}.xlsx"
+    return dcc.send_bytes(snapshot_excel_bytes(df), filename)
+
+
+@app.callback(
+    Output("page", "children"),
+    Input("url", "pathname"),
+    Input("analysis-mode", "value"),
+    Input("group-filter", "value"),
+    Input("subject-filter", "value"),
+    Input("year-filter", "value"),
+    Input("period-filter", "value"),
+    Input("school-filter", "value"),
+    Input("grade-filter", "value"),
+    Input("ethnicity-filter", "value"),
+    Input("intensity-filter", "value"),
+    Input("student-filter", "value"),
+)
+def render(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+    return cached_render_from_key(page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids))
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8050"))
+    app.run(debug=False, host="0.0.0.0", port=port)

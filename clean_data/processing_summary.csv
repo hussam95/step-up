@@ -1,0 +1,12 @@
+metric,value,definition
+students_master_total,2008,Unique District IDs represented in any academic source.
+students_with_step_roster_exact_match,130,"Exact normalized roster matches across all students, not limited to the core cohort."
+students_with_any_stepup_evidence,235,"Roster exact match, base STEP UP flag/tag, or CAASPP STEP UP tag."
+students_with_repeated_or_higher_stepup_exposure,105,Inferred from multiple STEP UP evidence sources or repeated STEP UP flags; not session dosage.
+students_with_3yr_star,227,"Any STAR record in 2022-23, 2023-24, and 2024-25."
+students_with_2023_24_and_2024_25_attendance,273,Attendance is available for 2023-24 and 2024-25; 2022-23 attendance remains unavailable.
+students_with_two_caaspp_years,251,2022-23 explicit CAASPP plus likely 2023-24 CAASPP from tier CSV.
+core_dashboard_cohort,171,"3-year STAR, 2023-24/2024-25 attendance, and two CAASPP sets."
+star_long_rows,20743,Normalized STAR records in long format.
+caaspp_long_rows,2072,Normalized CAASPP records in long format.
+attendance_long_rows,6368,Normalized attendance records in long format.

@@ -1,0 +1,14 @@
+file,field,description
+students_master.csv,student_id,Normalized District ID used as primary link key.
+students_master.csv,any_stepup_evidence,"True if roster, base flag/tag, or CAASPP tag indicates STEP UP."
+students_master.csv,stepup_exposure_level,Inferred STEP UP exposure category; not true dosage hours.
+students_master.csv,intervention_intensity_group,"Generic ATN intervention level, kept separate from STEP UP exposure."
+star_assessments_long.csv,school_year,STAR assessment year; explicit from source columns/file.
+star_assessments_long.csv,value_type,"score, benchmark_numeric, or tier depending on source column."
+caaspp_assessments_long.csv,school_year,2022-23 explicit or likely 2023-24 inferred from CSV grade progression.
+attendance_long.csv,school_year,2023-24 inferred from base context; 2024-25 explicit from ATN file.
+student_year_dashboard_base.csv,has_*,Boolean availability flags by student-year.
+cohort_coverage.csv,core_dashboard_cohort,"Students with 3-year STAR, 2-year attendance, and 2-year CAASPP."
+stepup_roster_normalized.csv,student_name_norm,Normalized roster name for matching to academic files.
+stepup_match_audit.csv,match_type,Exact normalized matches plus named manual-review candidates.
+processing_summary.csv,metric,High-level output counts for validation and dashboard planning.
