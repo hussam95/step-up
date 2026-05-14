@@ -23,6 +23,7 @@ RUST = "#b6573f"
 INK = "#20242a"
 TEMPLATE = "plotly_white"
 SEASON_ORDER = {"Fall": 1, "Winter": 2, "Spring": 3}
+STRICT_YEAR_SET = {"2022-23", "2023-24", "2024-25"}
 STATUS_ORDER = ["Improved", "Regressed", "Stayed Same"]
 STATUS_COLORS = {"Improved": GREEN, "Regressed": RUST, "Stayed Same": BLUE}
 OUTCOME_OPTIONS = [
@@ -201,6 +202,11 @@ def filters():
             html.Div(className="filter-control", children=[html.Label("Grade"), dcc.Dropdown(id="grade-filter", options=opts(students["grade_current"].dropna().astype(int)), value=[], multi=True, placeholder="All grades")]),
             html.Div(className="filter-control", children=[html.Label("Ethnicity"), dcc.Dropdown(id="ethnicity-filter", options=opts(students["ethnicity_group"]), value=[], multi=True, placeholder="All ethnicities")]),
             html.Div(className="filter-control", children=[html.Label("Intensity"), dcc.Dropdown(id="intensity-filter", options=opts(students["intervention_intensity"]), value=[], multi=True, placeholder="All intensities")]),
+            html.Div(
+                className="filter-note",
+                style={"gridColumn": "1 / -1", "fontSize": "12px", "lineHeight": "1.4", "color": "#5f6b77", "paddingTop": "2px"},
+                children="Strict mode stays on the 2022-25 comparison years for now. 2025-26 STAR and SIS attendance are available in All available mode; 2025-26 CAASPP is intentionally blank until it arrives.",
+            ),
         ],
     )
 
@@ -233,6 +239,11 @@ def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, school
     out = df.copy()
     if mode == "strict" and "strict_comparison_ready" in out.columns:
         out = out[out["strict_comparison_ready"].astype(bool)]
+    if mode == "strict":
+        if "school_year_display" in out.columns:
+            out = out[out["school_year_display"].isin(STRICT_YEAR_SET)]
+        elif "school_year" in out.columns:
+            out = out[out["school_year"].isin(STRICT_YEAR_SET)]
     if group != "all" and "student_group" in out.columns:
         out = out[out["student_group"].eq(group)]
     if subjects and "subject" in out.columns:
@@ -456,6 +467,11 @@ def filter_pairs(pairs: pd.DataFrame, mode, group, subjects, years, periods, sch
     if pairs.empty:
         return pairs
     out = pairs
+    if mode == "strict" and {"start_label", "end_label"}.issubset(out.columns):
+        out = out[
+            out["start_label"].astype(str).str[:7].isin(STRICT_YEAR_SET)
+            & out["end_label"].astype(str).str[:7].isin(STRICT_YEAR_SET)
+        ]
     if group != "all":
         out = out[out["student_group"].eq(group)]
     if subjects:
@@ -566,7 +582,7 @@ def cached_render_from_key(key):
         return student_page(dfs)
     if pathname == "/coverage":
         return coverage_page(dfs)
-    return overview(dfs, mode, group)
+    return overview(dfs, mode, group, years)
 
 
 def snapshot_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -771,13 +787,23 @@ def error_panel(message: str):
     )
 
 
-def overview(dfs, mode="all", requested_group="all"):
+def overview(dfs, mode="all", requested_group="all", selected_years=None):
     students = dfs["students"]
     pairs = filter_pairs(base_pairs(), mode, requested_group, None, None, None, None, None, None, None, None)
     story_group = primary_story_group(students, requested_group)
     story_prefix = story_group if story_group else "Selected"
     count_group = requested_group if requested_group in {"STEP UP", "Non-STEP UP"} else None
     count_label, count_note = student_count_label(count_group, mode)
+    if selected_years:
+        metric_ids = set()
+        for key in ["star", "attendance", "caaspp", "growth"]:
+            if key in dfs and len(dfs[key]):
+                metric_ids.update(dfs[key]["student_id"].astype(str))
+        visible_students = set(students["student_id"].astype(str)) & metric_ids
+        student_count = len(visible_students)
+        count_note = f"students with {', '.join(map(str, selected_years))} data"
+    else:
+        student_count = students["student_id"].nunique()
     star_reading = outcome_kpi_value(pairs, "STAR", "Reading", story_group)
     star_math = outcome_kpi_value(pairs, "STAR", "Math", story_group)
     caaspp_ela = outcome_kpi_value(pairs, "CAASPP", "ELA", story_group)
@@ -786,7 +812,7 @@ def overview(dfs, mode="all", requested_group="all"):
     cards = html.Div(
         className="kpi-grid",
         children=[
-            kpi(count_label, f"{len(students):,}", count_note),
+            kpi(count_label, f"{student_count:,}", count_note),
             kpi(f"{story_prefix} STAR Reading improved", star_reading[0], star_reading[1]),
             kpi(f"{story_prefix} STAR Math improved", star_math[0], star_math[1]),
             kpi(f"{story_prefix} Attendance improved", attendance[0], attendance[1]),
@@ -910,6 +936,7 @@ def star_growth_page(dfs):
     paired_students = star_pairs["student_id"].nunique() if len(star_pairs) else 0
 
     if len(growth):
+        period_order = ["Fall to Winter", "Winter to Spring", "Fall to Spring"]
         period_status = (
             growth.groupby(["student_group", "subject", "period", "change_status"])
             .size()
@@ -934,7 +961,7 @@ def star_growth_page(dfs):
             facet_col="subject",
             barmode="stack",
             category_orders={"change_status": STATUS_ORDER},
-            title="Where STAR students improved, regressed, or stayed flat",
+            title="Where STAR students improved, regressed, or stayed flat across all available years",
             template=TEMPLATE,
             color_discrete_map=STATUS_COLORS,
             labels={"period": "STAR period", "percent": "% of paired students", "change_status": "", "student_group": "", "subject": ""},
@@ -950,9 +977,10 @@ def star_growth_page(dfs):
             color="student_group",
             facet_col="subject",
             points=False,
-            title="Distribution of STAR score changes by period",
+            title="Distribution of STAR score changes by period across all available years",
             template=TEMPLATE,
             color_discrete_map={"STEP UP": GREEN, "Non-STEP UP": GOLD},
+            category_orders={"period": period_order},
             labels={"period": "STAR period", "change": "Score change", "student_group": "", "subject": ""},
         )
         fig_dist = soften_axes(polish(fig_dist), x_title="", y_title="Score change")
@@ -975,8 +1003,8 @@ def star_growth_page(dfs):
         fig_avg = soften_axes(polish(fig_avg), x_title="", y_title="Avg change")
     else:
         best_value, best_note = "0%", "No STAR period pairs"
-        fig_period = empty_fig("Where STAR students improved, regressed, or stayed flat")
-        fig_dist = empty_fig("Distribution of STAR score changes by period")
+        fig_period = empty_fig("Where STAR students improved, regressed, or stayed flat across all available years")
+        fig_dist = empty_fig("Distribution of STAR score changes by period across all available years")
         fig_avg = empty_fig("Average STAR change by year and period")
 
     if len(star_pairs):
@@ -1002,7 +1030,7 @@ def star_growth_page(dfs):
         className="insight-band",
         children=[
             html.H3("What this page adds"),
-            html.P("The overview shows the headline STAR direction. This page breaks that direction into specific STAR periods, shows the spread of student changes, and identifies which periods are carrying the gains."),
+            html.P("The first chart combines all available years and shows the share of students who improved, regressed, or stayed flat by STAR period. The middle chart shows the spread of score changes by STAR period across all available years. The year-by-year chart below separates changes by school year so you can compare trends over time."),
         ],
     )
     return page(
@@ -1204,13 +1232,13 @@ def attendance_caaspp_page(dfs):
     note = html.Div(
         className="insight-band",
         children=[
-            html.H3("What this page adds"),
-            html.P("The overview states the headline direction. This page separates CAASPP from attendance, shows the spread of annual changes, and tests whether attendance movement and CAASPP movement are traveling together for the same students."),
+            html.H3("How to read this page"),
+            html.P("Each student contributes one CAASPP pair per subject and one attendance pair, comparing the earliest and latest selected points in the current filter view. The top chart shows the share of paired students who improved, regressed, or stayed flat. The middle charts show the size of those changes for CAASPP and attendance. The lower-right scatter checks whether students with stronger attendance gains also tended to gain on CAASPP."),
         ],
     )
     return page(
         "CAASPP and Attendance",
-        "Annual assessment and attendance movement behind the overview story.",
+        "Earliest-to-latest CAASPP and attendance movement behind the overview story.",
         html.Div([cards, note, dcc.Graph(figure=fig_direction, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca_change), dcc.Graph(figure=fig_att_change)]), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca_level), dcc.Graph(figure=fig_relation)]), html.H2("CAASPP and attendance student change details"), html.Div(table, className="table-scroll")]),
     )
 
@@ -1359,9 +1387,9 @@ def coverage_page(dfs):
 
     expected = []
     for metric, years, sessions, subjects in [
-        ("STAR", ["2022-23", "2023-24", "2024-25"], ["Fall", "Winter", "Spring"], ["Reading", "Math"]),
-        ("CAASPP", ["2022-23", "2023-24", "2024-25"], ["Yearly"], ["ELA", "Math"]),
-        ("Attendance", ["2022-23", "2023-24", "2024-25"], ["Annual"], ["Attendance"]),
+        ("STAR", ["2022-23", "2023-24", "2024-25", "2025-26"], ["Fall", "Winter", "Spring"], ["Reading", "Math"]),
+        ("CAASPP", ["2022-23", "2023-24", "2024-25", "2025-26"], ["Yearly"], ["ELA", "Math"]),
+        ("Attendance", ["2022-23", "2023-24", "2024-25", "2025-26"], ["Annual"], ["Attendance"]),
     ]:
         for year in years:
             for session in sessions:
@@ -1416,7 +1444,7 @@ def coverage_page(dfs):
         className="insight-band",
         children=[
             html.H3("How to read coverage"),
-            html.P("This page is only about data availability. STAR is shown by year, season, and subject. CAASPP is yearly by subject. Attendance is annual. Medium-confidence fields are usable but have inferred-year context documented in the data notes."),
+            html.P("This page is only about data availability. STAR is shown by year, season, and subject. CAASPP is yearly by subject. Attendance is annual. Medium-confidence fields are usable but have inferred-year context documented in the data notes. Strict mode stays on the 2022-25 comparison years for now, so 2025-26 appears only in All available mode until CAASPP arrives."),
         ],
     )
     return page(

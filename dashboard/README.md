@@ -40,8 +40,10 @@ http://127.0.0.1:8050/
 
 ## Data Source
 
-The app reads the generated CSV files in `dashboard_data/`. Rebuild them with:
+The app reads the generated CSV files in `clean_data/`. Rebuild them with:
 
 ```powershell
 python .\scripts\build_dashboard_data.py
 ```
+
+Strict comparison mode currently stays on the 2022-25 comparison years. 2025-26 STAR and SIS attendance are available in the dashboard, but 2025-26 CAASPP is intentionally left blank until that source exists.
