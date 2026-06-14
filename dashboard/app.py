@@ -531,6 +531,46 @@ def clean_snapshot_rows(pairs: pd.DataFrame, outcome: str | None) -> pd.DataFram
     return out.sort_values(["change_status", "change"], ascending=[True, False])
 
 
+SNAPSHOT_COLUMN_HELP = {
+    "Student": "The student in this row.",
+    "Group": "The student group shown.",
+    "Outcome": "The measure shown in this row.",
+    "Start": "The first point being compared.",
+    "End": "The later point being compared.",
+    "Start Value": "The value at the start.",
+    "End Value": "The value at the end.",
+    "Change": "How much the value changed.",
+    "Status": "Whether the value went up, went down, or stayed flat.",
+}
+
+COVERAGE_COLUMN_HELP = {
+    "Metric": "The kind of data being counted.",
+    "Year": "The school year shown here.",
+    "Session": "The season or annual point.",
+    "Subject": "The subject or measure.",
+    "Group": "The student group shown.",
+    "Students": "How many students have this data.",
+    "Confidence": "How certain the year label is.",
+}
+
+
+def help_icon(text: str) -> html.Details:
+    return html.Details(
+        className="col-help",
+        children=[
+            html.Summary("i"),
+            html.Div(text, className="col-help-popover"),
+        ],
+    )
+
+
+def header_cell(label: str, help_text: str | None = None) -> html.Th:
+    children = [html.Span(label)]
+    if help_text:
+        children.append(help_icon(help_text))
+    return html.Th(html.Span(children, className="header-cell"))
+
+
 def snapshot_table(df: pd.DataFrame) -> html.Div | html.Table:
     if df.empty:
         return html.Div(
@@ -555,7 +595,7 @@ def snapshot_table(df: pd.DataFrame) -> html.Div | html.Table:
         rows.append(html.Tr([html.Td(str(row.get(c, ""))) for c in cols], className=status_class))
     return html.Table(
         className="data-table compact-table",
-        children=[html.Thead(html.Tr([html.Th(label) for label in labels])), html.Tbody(rows)],
+        children=[html.Thead(html.Tr([header_cell(label, SNAPSHOT_COLUMN_HELP.get(label)) for label in labels])), html.Tbody(rows)],
     )
 
 
@@ -1421,7 +1461,7 @@ def coverage_page(dfs):
     table = html.Table(
         className="data-table compact-table",
         children=[
-            html.Thead(html.Tr([html.Th(c) for c in ["Metric", "Year", "Session", "Subject", "Group", "Students", "Confidence"]])),
+            html.Thead(html.Tr([header_cell(c, COVERAGE_COLUMN_HELP.get(c)) for c in ["Metric", "Year", "Session", "Subject", "Group", "Students", "Confidence"]])),
             html.Tbody(
                 [
                     html.Tr([html.Td(str(row.get(c, ""))) for c in ["Metric", "Year", "Session", "Subject", "Group", "Students", "Confidence"]])
