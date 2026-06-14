@@ -529,11 +529,21 @@ def clean_snapshot_rows(pairs: pd.DataFrame, outcome: str | None) -> pd.DataFram
     out["change_display"] = out["change"].map(lambda x: f"{x:+.1f}")
     out["start_value_display"] = out["start_value"].map(lambda x: f"{x:,.1f}")
     out["end_value_display"] = out["end_value"].map(lambda x: f"{x:,.1f}")
+    student_details = DS["students"][["student_id", "school_current", "grade_current", "ethnicity_group"]].drop_duplicates("student_id")
+    out = out.merge(student_details, on="student_id", how="left")
+    out["school_display"] = out["school_current"].fillna("Unknown")
+    out["grade_display"] = out["grade_current"].map(
+        lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in {"", "nan"} else "Unknown"
+    )
+    out["ethnicity_display"] = out["ethnicity_group"].fillna("Unknown")
     return out.sort_values(["change_status", "change"], ascending=[True, False])
 
 
 SNAPSHOT_COLUMN_HELP = {
     "Student": "The student in this row.",
+    "School": "The current school for the student.",
+    "Grade": "The current grade for the student.",
+    "Ethnicity": "The student ethnicity group.",
     "Group": "The student group shown.",
     "Outcome": "The measure shown in this row.",
     "Start": "The first point being compared.",
@@ -578,8 +588,28 @@ def snapshot_table(df: pd.DataFrame) -> html.Div | html.Table:
             className="insight-band",
             children=[html.H3("No paired outcomes"), html.P("Select a broader group, year range, or outcome to show student-level changes.")],
         )
+    working = df.copy()
+    detail_cols = ["student_id", "school_current", "grade_current", "ethnicity_group"]
+    if "school_display" not in working.columns or "grade_display" not in working.columns or "ethnicity_display" not in working.columns:
+        if "student_id" in working.columns:
+            student_details = DS["students"][detail_cols].drop_duplicates("student_id")
+            working = working.merge(student_details, on="student_id", how="left")
+        if "school_display" not in working.columns:
+            school_source = working["school_current"] if "school_current" in working.columns else pd.Series([pd.NA] * len(working), index=working.index)
+            working["school_display"] = school_source.fillna("Unknown")
+        if "grade_display" not in working.columns:
+            grade_source = working["grade_current"] if "grade_current" in working.columns else pd.Series([pd.NA] * len(working), index=working.index)
+            working["grade_display"] = grade_source.map(
+                lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in {"", "nan"} else "Unknown"
+            )
+        if "ethnicity_display" not in working.columns:
+            ethnicity_source = working["ethnicity_group"] if "ethnicity_group" in working.columns else pd.Series([pd.NA] * len(working), index=working.index)
+            working["ethnicity_display"] = ethnicity_source.fillna("Unknown")
     cols = [
         "student_name",
+        "school_display",
+        "grade_display",
+        "ethnicity_display",
         "student_group",
         "outcome",
         "start_label",
@@ -589,9 +619,9 @@ def snapshot_table(df: pd.DataFrame) -> html.Div | html.Table:
         "change_display",
         "change_status",
     ]
-    labels = ["Student", "Group", "Outcome", "Start", "End", "Start Value", "End Value", "Change", "Status"]
+    labels = ["Student", "School", "Grade", "Ethnicity", "Group", "Outcome", "Start", "End", "Start Value", "End Value", "Change", "Status"]
     rows = []
-    for _, row in df[cols].iterrows():
+    for _, row in working[cols].iterrows():
         status_class = f"status-{str(row['change_status']).lower().replace(' ', '-')}"
         rows.append(html.Tr([html.Td(str(row.get(c, ""))) for c in cols], className=status_class))
     return html.Table(
@@ -632,6 +662,9 @@ def snapshot_excel_bytes(df: pd.DataFrame) -> bytes:
     export = df[
         [
             "student_name",
+            "school_display",
+            "grade_display",
+            "ethnicity_display",
             "student_group",
             "outcome",
             "start_label",
@@ -644,6 +677,9 @@ def snapshot_excel_bytes(df: pd.DataFrame) -> bytes:
     ].rename(
         columns={
             "student_name": "Student",
+            "school_display": "School",
+            "grade_display": "Grade",
+            "ethnicity_display": "Ethnicity",
             "student_group": "Group",
             "outcome": "Outcome",
             "start_label": "Start",
