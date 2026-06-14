@@ -171,6 +171,7 @@ def kpi(label: str, value: str, note: str = ""):
 def nav():
     links = [
         ("/", "Overview"),
+        ("/summary", "Summary"),
         ("/star", "STAR Growth"),
         ("/attendance-caaspp", "Attendance and CAASPP"),
         ("/coverage", "Data Coverage"),
@@ -616,6 +617,8 @@ def cached_render_from_key(key):
         return star_growth_page(dfs)
     if pathname == "/comparison":
         return comparison_page(dfs)
+    if pathname == "/summary":
+        return summary_page(dfs)
     if pathname == "/attendance-caaspp":
         return attendance_caaspp_page(dfs)
     if pathname == "/students":
@@ -678,6 +681,295 @@ def snapshot_excel_bytes(df: pd.DataFrame) -> bytes:
             ws.column_dimensions[column_cells[0].column_letter].width = width
         ws.freeze_panes = "A2"
     return output.getvalue()
+
+
+SUMMARY_CATEGORY_ORDER = [
+    "Outperformed non-STEP UP peers",
+    "Improved, but below non-STEP UP peers",
+    "Did not improve, below non-STEP UP peers",
+]
+
+SUMMARY_COLUMN_HELP = {
+    "Metric": "The metric selected for this table.",
+    "Student": "The student in this row.",
+    "District ID": "The student District ID.",
+    "School": "The current school for the student.",
+    "Grade": "The current grade for the student.",
+    "School Group": "The school group for the student.",
+    "Ethnicity": "The student ethnicity group.",
+    "Intensity": "The STEP UP intensity level.",
+    "Year": "The school year being shown.",
+    "Period": "The STAR period or annual measure.",
+    "Start": "The first point being compared.",
+    "End": "The later point being compared.",
+    "Start Value": "The value at the start.",
+    "End Value": "The value at the end.",
+    "Change": "How much the value changed.",
+    "Benchmark": "The average change for non-STEP UP students in the same year and metric.",
+    "Delta vs Benchmark": "How far this student is above or below the non-STEP UP average.",
+    "Summary Category": "Whether the student outperformed non-STEP UP peers, improved below them, or did not improve below them.",
+    "Status": "Whether the value went up, went down, or stayed flat.",
+}
+
+
+def summary_metric_label(metric: str) -> str:
+    return str(metric or "STAR Reading")
+
+
+def summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, intensities, student_ids):
+    return {
+        "students": filter_frame(DS["students"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
+        "star": filter_frame(DS["star"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
+        "attendance": filter_frame(DS["attendance"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
+        "caaspp": filter_frame(DS["caaspp"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
+    }
+
+
+def summary_merge_student_details(df: pd.DataFrame, students: pd.DataFrame) -> pd.DataFrame:
+    detail_cols = ["student_id", "school_current", "school_group", "grade_current", "ethnicity_group", "intervention_intensity"]
+    return df.merge(students[detail_cols], on="student_id", how="left")
+
+
+def summary_metric_rows(dfs: dict[str, pd.DataFrame], metric: str) -> pd.DataFrame:
+    metric = summary_metric_label(metric)
+    students = dfs["students"]
+    pairs = overview_outcome_pairs(dfs)
+    if pairs.empty:
+        return pairs
+    if metric.startswith("STAR "):
+        pairs = pairs[pairs["metric"].eq("STAR")].copy()
+        subject = metric.split(" ", 1)[1]
+        pairs = pairs[pairs["subject"].eq(subject)].copy()
+        bench_group = ["year", "subject"]
+        pairs["year"] = pairs["start_label"].astype(str).str.extract(r"^([^ ]+)")[0]
+    else:
+        pairs = pairs[pairs["metric"].eq("CAASPP" if metric.startswith("CAASPP ") else "Attendance")].copy()
+        if metric.startswith("CAASPP "):
+            subject = metric.split(" ", 1)[1]
+            pairs = pairs[pairs["subject"].eq(subject)].copy()
+        bench_group = ["year", "subject"] if metric.startswith("CAASPP ") else ["year"]
+        pairs["year"] = pairs.apply(
+            lambda row: row["start_label"] if str(row["start_label"]) == str(row["end_label"]) else f"{row['start_label']} → {row['end_label']}",
+            axis=1,
+        )
+    if pairs.empty:
+        return pairs
+    pairs = summary_merge_student_details(pairs, students)
+    pairs["period_label"] = "Annual"
+    bench = (
+        pairs[pairs["student_group"].eq("Non-STEP UP")]
+        .groupby(bench_group)["change"]
+        .mean()
+        .reset_index(name="benchmark")
+    )
+    rows = pairs.merge(bench, on=bench_group, how="left")
+    rows["summary_category"] = "Did not improve, below non-STEP UP peers"
+    rows.loc[rows["change"] > rows["benchmark"], "summary_category"] = "Outperformed non-STEP UP peers"
+    rows.loc[
+        (rows["change"] > 0) & (rows["change"] <= rows["benchmark"]),
+        "summary_category",
+    ] = "Improved, but below non-STEP UP peers"
+    rows["metric"] = metric
+
+    rows = rows[rows["student_group"].eq("STEP UP")].copy()
+    if rows.empty:
+        return rows
+    rows["delta_vs_benchmark"] = rows["change"] - rows["benchmark"]
+    rows["start_value_display"] = rows["start_value"].map(lambda x: f"{x:,.1f}")
+    rows["end_value_display"] = rows["end_value"].map(lambda x: f"{x:,.1f}")
+    rows["change_display"] = rows["change"].map(lambda x: f"{x:+.1f}")
+    rows["benchmark_display"] = rows["benchmark"].map(lambda x: f"{x:+.1f}")
+    rows["delta_display"] = rows["delta_vs_benchmark"].map(lambda x: f"{x:+.1f}")
+    school_current = rows["school_current"] if "school_current" in rows.columns else pd.Series([pd.NA] * len(rows), index=rows.index)
+    school_source = rows["school"] if "school" in rows.columns else pd.Series([pd.NA] * len(rows), index=rows.index)
+    grade_current = rows["grade_current"] if "grade_current" in rows.columns else pd.Series([pd.NA] * len(rows), index=rows.index)
+    grade_source = rows["grade_num"] if "grade_num" in rows.columns else pd.Series([pd.NA] * len(rows), index=rows.index)
+    rows["school_display"] = school_current.fillna(school_source).fillna("Unknown")
+    rows["grade_display"] = grade_current.fillna(grade_source).map(
+        lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in {"", "nan"} else "Unknown"
+    )
+    rows["school_group"] = rows["school_group"].fillna("Unknown") if "school_group" in rows.columns else "Unknown"
+    rows["ethnicity_group"] = rows["ethnicity_group"].fillna("Unknown") if "ethnicity_group" in rows.columns else "Unknown"
+    rows["intervention_intensity"] = rows["intervention_intensity"].fillna("Unknown") if "intervention_intensity" in rows.columns else "Unknown"
+    rows["start_display"] = rows["start_label"].fillna("")
+    rows["end_display"] = rows["end_label"].fillna("")
+    rows = rows.sort_values(["summary_category", "change"], ascending=[True, False])
+    return rows
+
+
+def summary_table(df: pd.DataFrame) -> html.Div | html.Table:
+    if df.empty:
+        return html.Div(
+            className="insight-band",
+            children=[html.H3("No STEP UP rows"), html.P("Try a different year, group, or metric to show the summary table.")],
+        )
+    cols = [
+        "metric",
+        "student_name",
+        "student_id",
+        "school_display",
+        "grade_display",
+        "school_group",
+        "ethnicity_group",
+        "intervention_intensity",
+        "year",
+        "period_label",
+        "start_display",
+        "end_display",
+        "start_value_display",
+        "end_value_display",
+        "change_display",
+        "benchmark_display",
+        "delta_display",
+        "summary_category",
+        "change_status",
+    ]
+    labels = [
+        "Metric",
+        "Student",
+        "District ID",
+        "School",
+        "Grade",
+        "School Group",
+        "Ethnicity",
+        "Intensity",
+        "Year",
+        "Period",
+        "Start",
+        "End",
+        "Start Value",
+        "End Value",
+        "Change",
+        "Benchmark",
+        "Delta vs Benchmark",
+        "Summary Category",
+        "Status",
+    ]
+    rows = []
+    for _, row in df[cols].iterrows():
+        status_class = f"status-{str(row['change_status']).lower().replace(' ', '-')}"
+        rows.append(html.Tr([html.Td(str(row.get(c, ""))) for c in cols], className=status_class))
+    return html.Table(
+        className="data-table compact-table",
+        children=[html.Thead(html.Tr([header_cell(label, SUMMARY_COLUMN_HELP.get(label)) for label in labels])), html.Tbody(rows)],
+    )
+
+
+def summary_excel_bytes(df: pd.DataFrame) -> bytes:
+    export = df[
+        [
+            "metric",
+            "student_name",
+            "student_id",
+            "school_display",
+            "grade_display",
+            "school_group",
+            "ethnicity_group",
+            "intervention_intensity",
+            "year",
+            "period_label",
+            "start_display",
+            "end_display",
+            "start_value_display",
+            "end_value_display",
+            "change_display",
+            "benchmark_display",
+            "delta_display",
+            "summary_category",
+            "change_status",
+        ]
+    ].rename(
+        columns={
+            "metric": "Metric",
+            "student_name": "Student",
+            "student_id": "District ID",
+            "school_display": "School",
+            "grade_display": "Grade",
+            "school_group": "School Group",
+            "ethnicity_group": "Ethnicity",
+            "intervention_intensity": "Intensity",
+            "year": "Year",
+            "period_label": "Period",
+            "start_display": "Start",
+            "end_display": "End",
+            "start_value_display": "Start Value",
+            "end_value_display": "End Value",
+            "change_display": "Change",
+            "benchmark_display": "Benchmark",
+            "delta_display": "Delta vs Benchmark",
+            "summary_category": "Summary Category",
+            "change_status": "Status",
+        }
+    )
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Summary", index=False)
+        ws = writer.sheets["Summary"]
+        from openpyxl.styles import Font, PatternFill
+
+        fills = {
+            "Improved": PatternFill("solid", fgColor="DCEFE8"),
+            "Regressed": PatternFill("solid", fgColor="F8DEDA"),
+            "Stayed Same": PatternFill("solid", fgColor="E9EDF3"),
+        }
+        header_fill = PatternFill("solid", fgColor="12313F")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = Font(color="FFFFFF", bold=True)
+        status_col = list(export.columns).index("Status") + 1
+        for row_idx in range(2, ws.max_row + 1):
+            status = ws.cell(row_idx, status_col).value
+            fill = fills.get(status)
+            if fill:
+                for cell in ws[row_idx]:
+                    cell.fill = fill
+        for column_cells in ws.columns:
+            width = min(max(len(str(cell.value or "")) for cell in column_cells) + 2, 36)
+            ws.column_dimensions[column_cells[0].column_letter].width = width
+        ws.freeze_panes = "A2"
+    return output.getvalue()
+
+
+def summary_cards(df: pd.DataFrame, metric: str, years) -> html.Div:
+    metric_label = summary_metric_label(metric)
+    selected_years = ", ".join(map(str, years)) if years else "all available years"
+    if df.empty:
+        return html.Div(
+            className="insight-band",
+            children=[
+                html.H3("Summary snapshot"),
+                html.P(f"No STEP UP rows are available for {metric_label} in {selected_years}. Try widening the filters."),
+            ],
+        )
+    outperformed = int(df["summary_category"].eq("Outperformed non-STEP UP peers").sum())
+    improved = int(df["summary_category"].eq("Improved, but below non-STEP UP peers").sum())
+    not_improved = int(df["summary_category"].eq("Did not improve, below non-STEP UP peers").sum())
+    return html.Div(
+        children=[
+            html.Div(
+                className="kpi-grid",
+                children=[
+                    kpi("STEP UP students", f"{len(df):,}", f"{metric_label} for {selected_years}"),
+                    kpi("Outperformed peers", f"{outperformed:,}", "Beat the non-STEP UP average"),
+                    kpi("Improved below peers", f"{improved:,}", "Went up, but not above the average"),
+                    kpi("Not improved below peers", f"{not_improved:,}", "Did not improve versus the average"),
+                ],
+            ),
+            html.Div(
+                className="insight-band",
+                children=[
+                    html.H3("How to read this table"),
+                    html.P(
+                        "Rows are STEP UP students only. The Metric column shows which measure you selected. "
+                        "Outperformed means the student did better than the non-STEP UP average. "
+                        "Improved, but below means the student got better, but not as much as the non-STEP UP average. "
+                        "Did not improve means the student did not show a gain."
+                    ),
+                ],
+            ),
+            html.Div(summary_table(df), className="table-scroll"),
+        ]
+    )
 
 
 def outcome_direction_summary(pairs: pd.DataFrame) -> pd.DataFrame:
@@ -963,6 +1255,54 @@ def overview(dfs, mode="all", requested_group="all", selected_years=None):
                 html.Div(id="overview-snapshot-table", className="table-scroll"),
             ]
         ),
+    )
+
+
+def summary_page(dfs):
+    controls = html.Div(
+        className="section-toolbar",
+        children=[
+            html.H2("Summary metric"),
+            html.Div(
+                className="snapshot-actions",
+                children=[
+                    html.Div(
+                        className="filter-control",
+                        children=[
+                            html.Label("Metric"),
+                            dcc.Dropdown(
+                                id="summary-metric-filter",
+                                options=OUTCOME_OPTIONS,
+                                value="STAR Reading",
+                                clearable=False,
+                                persistence=True,
+                                persistence_type="session",
+                            ),
+                        ],
+                    ),
+                    html.Button("Download Excel", id="download-summary-button", className="download-button", n_clicks=0),
+                    dcc.Download(id="download-summary"),
+                ],
+            ),
+        ],
+    )
+    note = html.Div(
+        className="insight-band",
+        children=[
+            html.H3("How to read this page"),
+            html.P(
+                "Use the Year filter to focus on one year, then choose a metric. "
+                "The table shows STEP UP students only. "
+                "Outperformed means the student did better than the non-STEP UP average. "
+                "Improved, but below means the student improved, but not enough to beat the non-STEP UP average. "
+                "Did not improve means the student did not show a gain."
+            ),
+        ],
+    )
+    return page(
+        "Summary",
+        "STEP UP students compared with non-STEP UP peers by metric and year.",
+        html.Div([controls, note, html.Div(id="summary-content")]),
     )
 
 
@@ -1632,6 +1972,49 @@ def download_overview_snapshot(n_clicks, outcome, mode, group, subjects, years, 
         raise PreventUpdate
     filename = f"student_outcome_snapshot_{str(outcome or 'outcome').lower().replace(' ', '_')}.xlsx"
     return dcc.send_bytes(snapshot_excel_bytes(df), filename)
+
+
+@app.callback(
+    Output("summary-content", "children"),
+    Input("summary-metric-filter", "value"),
+    Input("analysis-mode", "value"),
+    Input("group-filter", "value"),
+    Input("year-filter", "value"),
+    Input("school-filter", "value"),
+    Input("grade-filter", "value"),
+    Input("ethnicity-filter", "value"),
+    Input("intensity-filter", "value"),
+    Input("student-filter", "value"),
+)
+def update_summary_content(metric, mode, group, years, schools, grades, ethnicities, intensities, student_ids):
+    dfs = summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, intensities, student_ids)
+    rows = summary_metric_rows(dfs, metric)
+    return summary_cards(rows, metric, years)
+
+
+@app.callback(
+    Output("download-summary", "data"),
+    Input("download-summary-button", "n_clicks"),
+    State("summary-metric-filter", "value"),
+    State("analysis-mode", "value"),
+    State("group-filter", "value"),
+    State("year-filter", "value"),
+    State("school-filter", "value"),
+    State("grade-filter", "value"),
+    State("ethnicity-filter", "value"),
+    State("intensity-filter", "value"),
+    State("student-filter", "value"),
+    prevent_initial_call=True,
+)
+def download_summary(n_clicks, metric, mode, group, years, schools, grades, ethnicities, intensities, student_ids):
+    if not n_clicks:
+        raise PreventUpdate
+    dfs = summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, intensities, student_ids)
+    rows = summary_metric_rows(dfs, metric)
+    if rows.empty:
+        raise PreventUpdate
+    filename = f"step_up_summary_{str(metric or 'metric').lower().replace(' ', '_')}.xlsx"
+    return dcc.send_bytes(summary_excel_bytes(rows), filename)
 
 
 @app.callback(
