@@ -114,6 +114,10 @@ body {
   box-shadow: var(--shadow-soft);
 }
 
+.dosage-controls {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .filter-control {
   grid-column: span 2;
   min-width: 0;

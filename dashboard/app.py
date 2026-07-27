@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from pathlib import Path
 from functools import lru_cache
 
@@ -15,6 +16,7 @@ from dash.exceptions import PreventUpdate
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "clean_data"
+DOSAGE_FILE = DATA / "dosage_long.csv"
 
 GREEN = "#2f7d6d"
 GOLD = "#8a6f3d"
@@ -26,6 +28,14 @@ SEASON_ORDER = {"Fall": 1, "Winter": 2, "Spring": 3}
 STRICT_YEAR_SET = {"2022-23", "2023-24", "2024-25"}
 STATUS_ORDER = ["Improved", "Regressed", "Stayed Same"]
 STATUS_COLORS = {"Improved": GREEN, "Regressed": RUST, "Stayed Same": BLUE}
+DOSAGE_BUCKET_ORDER = ["0%", "1-25%", "26-50%", "51-75%", "76-100%"]
+DOSAGE_BUCKET_COLORS = {
+    "0%": "#c8d1db",
+    "1-25%": "#88a9d4",
+    "26-50%": GOLD,
+    "51-75%": GREEN,
+    "76-100%": RUST,
+}
 OUTCOME_OPTIONS = [
     {"label": "STAR Reading", "value": "STAR Reading"},
     {"label": "STAR Math", "value": "STAR Math"},
@@ -33,6 +43,57 @@ OUTCOME_OPTIONS = [
     {"label": "CAASPP Math", "value": "CAASPP Math"},
     {"label": "Attendance", "value": "Attendance"},
 ]
+
+def clean_name(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).lower().strip()
+    if "," in text:
+        last, first = text.split(",", 1)
+        text = f"{first} {last}"
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def name_key(value) -> str:
+    return clean_name(value).replace(" ", "")
+
+
+def load_dosage_data() -> pd.DataFrame:
+    if not DOSAGE_FILE.exists():
+        return pd.DataFrame(
+            columns=[
+                "student_id",
+                "student_name",
+                "student_name_norm",
+                "school_current",
+                "school_group",
+                "grade_current",
+                "ethnicity_group",
+                "student_group",
+                "is_stepup",
+                "program_count",
+                "programs",
+                "program_years",
+                "dosage_sessions_attended",
+                "dosage_sessions_possible",
+                "dosage_rate",
+                "dosage_bucket",
+            ]
+        )
+    dosage = pd.read_csv(DOSAGE_FILE)
+    for col in ["student_id", "student_name", "student_name_norm", "school_current", "school_group", "ethnicity_group", "student_group", "programs", "program_years", "dosage_bucket"]:
+        if col in dosage.columns:
+            dosage[col] = dosage[col].fillna("").astype(str)
+    for col in ["grade_current", "program_count", "dosage_sessions_attended", "dosage_sessions_possible"]:
+        if col in dosage.columns:
+            dosage[col] = pd.to_numeric(dosage[col], errors="coerce")
+    if "is_stepup" in dosage.columns:
+        dosage["is_stepup"] = dosage["is_stepup"].astype(bool)
+    if "dosage_rate" not in dosage.columns and {"dosage_sessions_attended", "dosage_sessions_possible"}.issubset(dosage.columns):
+        dosage["dosage_rate"] = dosage["dosage_sessions_attended"] / dosage["dosage_sessions_possible"].replace({0: np.nan})
+    dosage["dosage_rate"] = pd.to_numeric(dosage.get("dosage_rate"), errors="coerce").fillna(0.0)
+    return dosage
 
 
 def load_data() -> dict[str, pd.DataFrame]:
@@ -42,9 +103,12 @@ def load_data() -> dict[str, pd.DataFrame]:
     caaspp = pd.read_csv(DATA / "caaspp_long.csv")
     growth = pd.read_csv(DATA / "star_growth_pairs.csv")
     availability = pd.read_csv(DATA / "availability_summary.csv")
+    dosage = load_dosage_data()
 
     for df in [students, star, attendance, caaspp, growth]:
         df["student_id"] = df["student_id"].astype(str)
+    if "student_id" in dosage.columns:
+        dosage["student_id"] = dosage["student_id"].astype(str)
 
     students["student_label"] = (
         students["student_name"].fillna("Unknown").astype(str)
@@ -60,6 +124,7 @@ def load_data() -> dict[str, pd.DataFrame]:
         "caaspp": caaspp,
         "growth": growth,
         "availability": availability,
+        "dosage": dosage,
     }
 
 
@@ -100,7 +165,7 @@ def normalize_values(values):
     return tuple(values)
 
 
-def cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+def cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids):
     return (
         mode,
         group,
@@ -110,7 +175,6 @@ def cache_key(mode, group, subjects, years, periods, schools, grades, ethnicitie
         normalize_values(schools),
         normalize_values(grades),
         normalize_values(ethnicities),
-        normalize_values(intensities),
         normalize_values(student_ids),
     )
 
@@ -174,6 +238,7 @@ def nav():
         ("/summary", "Summary"),
         ("/star", "STAR Growth"),
         ("/attendance-caaspp", "Attendance and CAASPP"),
+        ("/dosage", "Dosage vs Performance"),
         ("/coverage", "Data Coverage"),
     ]
     return html.Div(
@@ -202,7 +267,7 @@ def filters():
             html.Div(className="filter-control", children=[html.Label("School"), dcc.Dropdown(id="school-filter", options=opts(students["school_group"]), value=[], multi=True, placeholder="All schools")]),
             html.Div(className="filter-control", children=[html.Label("Grade"), dcc.Dropdown(id="grade-filter", options=opts(students["grade_current"].dropna().astype(int)), value=[], multi=True, placeholder="All grades")]),
             html.Div(className="filter-control", children=[html.Label("Ethnicity"), dcc.Dropdown(id="ethnicity-filter", options=opts(students["ethnicity_group"]), value=[], multi=True, placeholder="All ethnicities")]),
-            html.Div(className="filter-control", children=[html.Label("Intensity"), dcc.Dropdown(id="intensity-filter", options=opts(students["intervention_intensity"]), value=[], multi=True, placeholder="All intensities")]),
+            html.Div(className="filter-control", children=[html.Label("Dosage bucket"), dcc.Dropdown(id="dosage-bucket-filter", options=[{"label": bucket, "value": bucket} for bucket in DOSAGE_BUCKET_ORDER], value=[], multi=True, placeholder="All dosage buckets")]),
             html.Div(
                 className="filter-note",
                 style={"gridColumn": "1 / -1", "fontSize": "12px", "lineHeight": "1.4", "color": "#5f6b77", "paddingTop": "2px"},
@@ -236,7 +301,7 @@ def base_layout():
     )
 
 
-def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, schools, grades, ethnicities, student_ids):
     out = df.copy()
     if mode == "strict" and "strict_comparison_ready" in out.columns:
         out = out[out["strict_comparison_ready"].astype(bool)]
@@ -265,8 +330,6 @@ def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, school
         out = out[out["grade_current"].isin(grades)]
     if ethnicities and "ethnicity_group" in out.columns:
         out = out[out["ethnicity_group"].isin(ethnicities)]
-    if intensities and "intervention_intensity" in out.columns:
-        out = out[out["intervention_intensity"].isin(intensities)]
     if student_ids and "student_id" in out.columns:
         out = out[out["student_id"].isin([str(x) for x in student_ids])]
     return out
@@ -274,20 +337,25 @@ def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, school
 
 @lru_cache(maxsize=128)
 def cached_filtered(*key):
-    mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids = key
-    students = filter_frame(DS["students"], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+    mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids = key
+    students = filter_frame(DS["students"], group, mode, subjects, years, periods, schools, grades, ethnicities, student_ids)
     ids = set(students["student_id"])
+    dosage = DS["dosage"][DS["dosage"]["student_id"].isin(ids)].copy()
+    if years and len(dosage) and "program_years" in dosage.columns:
+        year_values = {str(year) for year in years}
+        dosage = dosage[dosage["program_years"].astype(str).apply(lambda text: any(year in text for year in year_values))]
     return {
         "students": students,
-        "star": filter_frame(DS["star"][DS["star"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
-        "attendance": filter_frame(DS["attendance"][DS["attendance"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
-        "caaspp": filter_frame(DS["caaspp"][DS["caaspp"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
-        "growth": filter_frame(DS["growth"][DS["growth"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids),
+        "star": filter_frame(DS["star"][DS["star"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, student_ids),
+        "attendance": filter_frame(DS["attendance"][DS["attendance"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, student_ids),
+        "caaspp": filter_frame(DS["caaspp"][DS["caaspp"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, student_ids),
+        "growth": filter_frame(DS["growth"][DS["growth"]["student_id"].isin(ids)], group, mode, subjects, years, periods, schools, grades, ethnicities, student_ids),
+        "dosage": dosage,
     }
 
 
-def get_filtered(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
-    return cached_filtered(*cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids))
+def get_filtered(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids):
+    return cached_filtered(*cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids))
 
 
 def filtered_availability(dfs):
@@ -464,7 +532,7 @@ def cached_overview_outcome_pairs(*key):
     return overview_outcome_pairs(dfs)
 
 
-def filter_pairs(pairs: pd.DataFrame, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+def filter_pairs(pairs: pd.DataFrame, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids):
     if pairs.empty:
         return pairs
     out = pairs
@@ -630,19 +698,22 @@ def snapshot_table(df: pd.DataFrame) -> html.Div | html.Table:
     )
 
 
-def filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids, outcome):
-    pairs = filter_pairs(base_pairs(), mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+def filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, outcome):
+    pairs = filter_pairs(base_pairs(), mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids)
     return clean_snapshot_rows(pairs, outcome)
 
 
-def page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
-    return (pathname,) + cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+def page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, dosage_programs, dosage_buckets):
+    return (pathname,) + cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids) + (
+        normalize_values(dosage_programs),
+        normalize_values(dosage_buckets),
+    )
 
 
 @lru_cache(maxsize=64)
 def cached_render_from_key(key):
-    pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids = key
-    dfs = get_filtered(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids)
+    pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, dosage_programs, dosage_buckets = key
+    dfs = get_filtered(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids)
     if pathname == "/star":
         return star_growth_page(dfs)
     if pathname == "/comparison":
@@ -651,6 +722,8 @@ def cached_render_from_key(key):
         return summary_page(dfs)
     if pathname == "/attendance-caaspp":
         return attendance_caaspp_page(dfs)
+    if pathname == "/dosage":
+        return dosage_page(dfs, dosage_programs, dosage_buckets)
     if pathname == "/students":
         return student_page(dfs)
     if pathname == "/coverage":
@@ -752,12 +825,12 @@ def summary_metric_label(metric: str) -> str:
     return str(metric or "STAR Reading")
 
 
-def summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, intensities, student_ids):
+def summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, student_ids):
     return {
-        "students": filter_frame(DS["students"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
-        "star": filter_frame(DS["star"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
-        "attendance": filter_frame(DS["attendance"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
-        "caaspp": filter_frame(DS["caaspp"], group, mode, None, years, None, schools, grades, ethnicities, intensities, student_ids),
+        "students": filter_frame(DS["students"], group, mode, None, years, None, schools, grades, ethnicities, student_ids),
+        "star": filter_frame(DS["star"], group, mode, None, years, None, schools, grades, ethnicities, student_ids),
+        "attendance": filter_frame(DS["attendance"], group, mode, None, years, None, schools, grades, ethnicities, student_ids),
+        "caaspp": filter_frame(DS["caaspp"], group, mode, None, years, None, schools, grades, ethnicities, student_ids),
     }
 
 
@@ -1157,7 +1230,7 @@ def error_panel(message: str):
 
 def overview(dfs, mode="all", requested_group="all", selected_years=None):
     students = dfs["students"]
-    pairs = filter_pairs(base_pairs(), mode, requested_group, None, None, None, None, None, None, None, None)
+    pairs = filter_pairs(base_pairs(), mode, requested_group, None, None, None, None, None, None, None)
     story_group = primary_story_group(students, requested_group)
     story_prefix = story_group if story_group else "Selected"
     count_group = requested_group if requested_group in {"STEP UP", "Non-STEP UP"} else None
@@ -1724,6 +1797,188 @@ def student_page(dfs):
     return page("Student Drilldown", "Search one or more students above to inspect the records we have for them.", html.Div([dcc.Graph(figure=fig_star, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)]), html.H2("Students in selection"), table]))
 
 
+def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
+    dosage = dfs.get("dosage", pd.DataFrame()).copy()
+    if dosage.empty:
+        return page(
+            "Dosage vs Performance",
+            "See how STAR, CAASPP, and attendance move as STEP UP dosage increases.",
+            html.Div(
+                className="insight-band",
+                children=[
+                    html.H3("No dosage data available"),
+                    html.P("The dosage workbook did not produce any matched student records for the current filters."),
+                ],
+            ),
+        )
+
+    bucket_values = set(normalize_values(dosage_buckets))
+    if bucket_values:
+        dosage = dosage[dosage["dosage_bucket"].isin(bucket_values)]
+    if dosage.empty:
+        return page(
+            "Dosage vs Performance",
+            "See how STAR, CAASPP, and attendance move as STEP UP dosage increases.",
+            html.Div(
+                className="insight-band",
+                children=[
+                    html.H3("No dosage data for this selection"),
+                    html.P("Try widening the dosage bucket filter or the global student filters."),
+                ],
+            ),
+        )
+
+    star = dfs["star"].copy()
+    if len(star):
+        star = star[star["value_type"].eq("score")].copy()
+        star = star.merge(dosage[["student_id", "dosage_bucket"]], on="student_id", how="inner")
+        star["season_order"] = star["season"].map(SEASON_ORDER).fillna(9)
+        star["time_order"] = star["school_year"].astype(str).str.slice(0, 4).astype(int) * 10 + star["season_order"]
+        star["time_label"] = star["school_year"].astype(str) + " " + star["season"].astype(str)
+        star_trend = star.groupby(["time_label", "time_order", "subject", "dosage_bucket"])["value"].mean().reset_index().sort_values("time_order")
+        fig_star = px.line(
+            star_trend,
+            x="time_label",
+            y="value",
+            color="dosage_bucket",
+            facet_col="subject",
+            markers=True,
+            title="STAR trend over time by dosage bucket",
+            template=TEMPLATE,
+            color_discrete_map=DOSAGE_BUCKET_COLORS,
+            category_orders={"dosage_bucket": DOSAGE_BUCKET_ORDER},
+            labels={"time_label": "Year and season", "value": "Average STAR score", "dosage_bucket": "Dosage bucket", "subject": ""},
+        )
+        fig_star = polish(fig_star)
+        fig_star = soften_axes(fig_star, x_title="", y_title="Average STAR score", hide_repeated_y=False)
+    else:
+        fig_star = empty_fig("STAR trend over time by dosage bucket")
+
+    caaspp = dfs["caaspp"].copy()
+    if len(caaspp):
+        caaspp = caaspp.merge(dosage[["student_id", "dosage_bucket"]], on="student_id", how="inner")
+        ca_trend = caaspp.groupby(["school_year_display", "subject", "dosage_bucket"])["value"].mean().reset_index().sort_values("school_year_display")
+        fig_ca = px.line(
+            ca_trend,
+            x="school_year_display",
+            y="value",
+            color="dosage_bucket",
+            facet_col="subject",
+            markers=True,
+            title="CAASPP trend over time by dosage bucket",
+            template=TEMPLATE,
+            color_discrete_map=DOSAGE_BUCKET_COLORS,
+            category_orders={"dosage_bucket": DOSAGE_BUCKET_ORDER},
+            labels={"school_year_display": "Year", "value": "Average CAASPP score", "dosage_bucket": "Dosage bucket", "subject": ""},
+        )
+        fig_ca = polish(fig_ca)
+        fig_ca = soften_axes(fig_ca, x_title="", y_title="Average CAASPP score", hide_repeated_y=False)
+    else:
+        fig_ca = empty_fig("CAASPP trend over time by dosage bucket")
+
+    attendance = dfs["attendance"].copy()
+    if len(attendance):
+        attendance["measure_rank"] = attendance["measure"].map({"SIS Reported Rate": 0, "Attendance rate": 1, "Full Day Rate": 2}).fillna(9)
+        attendance = attendance.sort_values("measure_rank").drop_duplicates(["student_id", "school_year"], keep="first")
+        attendance = attendance.merge(dosage[["student_id", "dosage_bucket"]], on="student_id", how="inner")
+        att_trend = attendance.groupby(["school_year", "dosage_bucket"])["value"].mean().reset_index().sort_values("school_year")
+        fig_att = px.line(
+            att_trend,
+            x="school_year",
+            y="value",
+            color="dosage_bucket",
+            markers=True,
+            title="Attendance trend over time by dosage bucket",
+            template=TEMPLATE,
+            color_discrete_map=DOSAGE_BUCKET_COLORS,
+            category_orders={"dosage_bucket": DOSAGE_BUCKET_ORDER},
+            labels={"school_year": "Year", "value": "Average attendance", "dosage_bucket": "Dosage bucket"},
+        )
+        fig_att.update_yaxes(range=[0, 100])
+        fig_att = polish(fig_att)
+        fig_att = soften_axes(fig_att, x_title="", y_title="Average attendance", hide_repeated_y=False)
+    else:
+        fig_att = empty_fig("Attendance trend over time by dosage bucket")
+
+    bucket_profile = dosage.groupby("dosage_bucket")["student_id"].nunique().reindex(DOSAGE_BUCKET_ORDER, fill_value=0).reset_index(name="students")
+    fig_bucket = px.bar(
+        bucket_profile,
+        x="dosage_bucket",
+        y="students",
+        color="dosage_bucket",
+        title="Students by dosage bucket",
+        template=TEMPLATE,
+        color_discrete_map=DOSAGE_BUCKET_COLORS,
+        category_orders={"dosage_bucket": DOSAGE_BUCKET_ORDER},
+        labels={"dosage_bucket": "Dosage bucket", "students": "Students"},
+    )
+    fig_bucket = polish(fig_bucket)
+    fig_bucket = soften_axes(fig_bucket, x_title="", y_title="Students", hide_repeated_y=False)
+
+    summary = dosage.sort_values(["dosage_sessions_attended", "student_name"], ascending=[False, True]).copy()
+    summary["dosage_rate_display"] = summary["dosage_rate"].map(lambda x: f"{x * 100:.1f}%")
+    summary["dosage_sessions_attended"] = summary["dosage_sessions_attended"].astype(int)
+    summary["dosage_sessions_possible"] = summary["dosage_sessions_possible"].astype(int)
+    table_cols = [
+        "student_name",
+        "school_current",
+        "grade_current",
+        "student_group",
+        "dosage_sessions_attended",
+        "dosage_sessions_possible",
+        "dosage_rate_display",
+        "dosage_bucket",
+        "program_count",
+    ]
+    table_labels = ["Student", "School", "Grade", "Group", "Attended", "Possible", "Dosage rate", "Bucket", "Programs"]
+    table = html.Table(
+        className="data-table compact-table",
+        children=[
+            html.Thead(html.Tr([header_cell(label) for label in table_labels])),
+            html.Tbody([html.Tr([html.Td(str(row.get(col, ""))) for col in table_cols]) for _, row in summary[table_cols].head(60).iterrows()]),
+        ],
+    )
+
+    student_count = summary["student_id"].nunique()
+    avg_sessions = summary["dosage_sessions_attended"].mean()
+    avg_rate = summary["dosage_rate"].mean()
+    median_sessions = summary["dosage_sessions_attended"].median()
+    cards = html.Div(
+        className="kpi-grid",
+        children=[
+            kpi("Students with dosage", f"{student_count:,}", "Matched STEP UP students with attendance records"),
+            kpi("Avg attended sessions", f"{avg_sessions:.1f}", "Across matched dosage records"),
+            kpi("Average dosage rate", f"{avg_rate * 100:.1f}%", "Attended sessions divided by possible sessions"),
+            kpi("Median attended sessions", f"{median_sessions:.1f}", "Middle dosage value in the filtered view"),
+        ],
+    )
+    note = html.Div(
+        className="insight-band",
+        children=[
+            html.H3("How to read this page"),
+            html.P(
+                "Dosage here is the count of attended sessions across the STEP UP attendance workbook, normalized into comparable percentage buckets because the underlying programs have different session counts. "
+                "Use the dosage bucket filter to narrow the view, then compare how STAR, CAASPP, and attendance move over time for students in that dose range."
+            ),
+        ],
+    )
+    return page(
+        "Dosage vs Performance",
+        "See how STAR, CAASPP, and attendance move as STEP UP dosage increases.",
+        html.Div(
+            [
+                cards,
+                note,
+                dcc.Graph(figure=fig_star, className="chart wide"),
+                html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)]),
+                dcc.Graph(figure=fig_bucket, className="chart wide"),
+                html.H2("Dosage student detail"),
+                html.Div(table, className="table-scroll"),
+            ]
+        ),
+    )
+
+
 def coverage_page(dfs):
     students = dfs["students"]
     total_students = students["student_id"].nunique()
@@ -1894,7 +2149,6 @@ app.layout = base_layout
     Output("school-filter", "options"),
     Output("grade-filter", "options"),
     Output("ethnicity-filter", "options"),
-    Output("intensity-filter", "options"),
     Input("analysis-mode", "value"),
     Input("group-filter", "value"),
     Input("subject-filter", "value"),
@@ -1903,10 +2157,9 @@ app.layout = base_layout
     Input("school-filter", "value"),
     Input("grade-filter", "value"),
     Input("ethnicity-filter", "value"),
-    Input("intensity-filter", "value"),
     Input("student-filter", "value"),
 )
-def cascade_filter_options(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+def cascade_filter_options(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids):
     students = DS["students"].copy()
     if mode == "strict":
         students = students[students["strict_comparison_ready"].astype(bool)]
@@ -1920,8 +2173,6 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
         students = students[students["grade_current"].isin(grades)]
     if ethnicities:
         students = students[students["ethnicity_group"].isin(ethnicities)]
-    if intensities:
-        students = students[students["intervention_intensity"].isin(intensities)]
 
     ids = set(students["student_id"])
     star = DS["star"][DS["star"]["student_id"].isin(ids)]
@@ -1945,6 +2196,13 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
     if periods:
         growth = growth[growth["period"].isin(periods)]
 
+    dosage_year_values = []
+    if len(DS["dosage"]):
+        dosage_subset = DS["dosage"][DS["dosage"]["student_id"].isin(ids)]
+        if "program_years" in dosage_subset.columns:
+            for text in dosage_subset["program_years"].dropna().astype(str):
+                dosage_year_values.extend([part.strip() for part in text.split(";") if part.strip()])
+
     student_options = opts_from_frame(students.sort_values("student_label"), "student_label", "student_id")
     subject_options = opts(subject_context[subject_context.isin(["Reading", "Math"])])
     year_values = pd.concat(
@@ -1953,6 +2211,7 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
             growth["school_year"],
             caaspp["school_year_display"],
             DS["attendance"][DS["attendance"]["student_id"].isin(ids)]["school_year"],
+            pd.Series(dosage_year_values, dtype=object),
         ],
         ignore_index=True,
     )
@@ -1961,8 +2220,7 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
     school_options = opts(students["school_group"])
     grade_options = opts(students["grade_current"].dropna().astype(int))
     ethnicity_options = opts(students["ethnicity_group"])
-    intensity_options = opts(students["intervention_intensity"])
-    return student_options, subject_options, year_options, period_options, school_options, grade_options, ethnicity_options, intensity_options
+    return student_options, subject_options, year_options, period_options, school_options, grade_options, ethnicity_options
 
 
 @app.callback(
@@ -1976,11 +2234,10 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
     Input("school-filter", "value"),
     Input("grade-filter", "value"),
     Input("ethnicity-filter", "value"),
-    Input("intensity-filter", "value"),
     Input("student-filter", "value"),
 )
-def update_overview_snapshot(outcome, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
-    df = filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids, outcome)
+def update_overview_snapshot(outcome, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids):
+    df = filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, outcome)
     return snapshot_table(df)
 
 
@@ -1996,14 +2253,13 @@ def update_overview_snapshot(outcome, mode, group, subjects, years, periods, sch
     State("school-filter", "value"),
     State("grade-filter", "value"),
     State("ethnicity-filter", "value"),
-    State("intensity-filter", "value"),
     State("student-filter", "value"),
     prevent_initial_call=True,
 )
-def download_overview_snapshot(n_clicks, outcome, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+def download_overview_snapshot(n_clicks, outcome, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids):
     if not n_clicks:
         raise PreventUpdate
-    df = filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids, outcome)
+    df = filtered_snapshot(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, outcome)
     if df.empty:
         raise PreventUpdate
     filename = f"student_outcome_snapshot_{str(outcome or 'outcome').lower().replace(' ', '_')}.xlsx"
@@ -2019,11 +2275,10 @@ def download_overview_snapshot(n_clicks, outcome, mode, group, subjects, years, 
     Input("school-filter", "value"),
     Input("grade-filter", "value"),
     Input("ethnicity-filter", "value"),
-    Input("intensity-filter", "value"),
     Input("student-filter", "value"),
 )
-def update_summary_content(metric, mode, group, years, schools, grades, ethnicities, intensities, student_ids):
-    dfs = summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, intensities, student_ids)
+def update_summary_content(metric, mode, group, years, schools, grades, ethnicities, student_ids):
+    dfs = summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, student_ids)
     rows = summary_metric_rows(dfs, metric)
     return summary_cards(rows, metric, years)
 
@@ -2038,14 +2293,13 @@ def update_summary_content(metric, mode, group, years, schools, grades, ethnicit
     State("school-filter", "value"),
     State("grade-filter", "value"),
     State("ethnicity-filter", "value"),
-    State("intensity-filter", "value"),
     State("student-filter", "value"),
     prevent_initial_call=True,
 )
-def download_summary(n_clicks, metric, mode, group, years, schools, grades, ethnicities, intensities, student_ids):
+def download_summary(n_clicks, metric, mode, group, years, schools, grades, ethnicities, student_ids):
     if not n_clicks:
         raise PreventUpdate
-    dfs = summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, intensities, student_ids)
+    dfs = summary_filtered_dfs(mode, group, years, schools, grades, ethnicities, student_ids)
     rows = summary_metric_rows(dfs, metric)
     if rows.empty:
         raise PreventUpdate
@@ -2064,12 +2318,12 @@ def download_summary(n_clicks, metric, mode, group, years, schools, grades, ethn
     Input("school-filter", "value"),
     Input("grade-filter", "value"),
     Input("ethnicity-filter", "value"),
-    Input("intensity-filter", "value"),
     Input("student-filter", "value"),
+    Input("dosage-bucket-filter", "value"),
 )
-def render(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids):
+def render(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, dosage_buckets):
     try:
-        return cached_render_from_key(page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, intensities, student_ids))
+        return cached_render_from_key(page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, None, dosage_buckets))
     except Exception as exc:
         import traceback
 
