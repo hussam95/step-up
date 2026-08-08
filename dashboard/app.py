@@ -260,11 +260,11 @@ def filters():
         children=[
             html.Div(className="filter-control student-filter", children=[html.Label("Student / ID"), dcc.Dropdown(id="student-filter", options=student_options.to_dict("records"), value=[], multi=True, placeholder="Search name or District ID")]),
             html.Div(className="filter-control compact-radio", children=[html.Label("Student set"), dcc.RadioItems(id="analysis-mode", options=[{"label": "All available", "value": "all"}, {"label": "Complete comparison", "value": "strict"}], value="all", inline=True)]),
-            html.Div(className="filter-control compact-radio", children=[html.Label("Group"), dcc.RadioItems(id="group-filter", options=[{"label": "All", "value": "all"}, {"label": "STEP UP", "value": "STEP UP"}, {"label": "Non-STEP UP", "value": "Non-STEP UP"}], value="all", inline=True)]),
+            html.Div(id="group-filter-wrap", className="filter-control compact-radio", children=[html.Label("Group"), dcc.RadioItems(id="group-filter", options=[{"label": "All", "value": "all"}, {"label": "STEP UP", "value": "STEP UP"}, {"label": "Non-STEP UP", "value": "Non-STEP UP"}], value="all", inline=True)]),
             html.Div(className="filter-control", children=[html.Label("Subject"), dcc.Dropdown(id="subject-filter", options=[{"label": "Reading", "value": "Reading"}, {"label": "Math", "value": "Math"}], value=["Reading", "Math"], multi=True)]),
             html.Div(className="filter-control", children=[html.Label("Year"), dcc.Dropdown(id="year-filter", options=opts(DS["growth"]["school_year"]), value=[], multi=True, placeholder="All years")]),
             html.Div(className="filter-control", children=[html.Label("STAR period"), dcc.Dropdown(id="period-filter", options=opts(DS["growth"]["period"]), value=[], multi=True, placeholder="All periods")]),
-            html.Div(className="filter-control", children=[html.Label("School"), dcc.Dropdown(id="school-filter", options=opts(students["school_group"]), value=[], multi=True, placeholder="All schools")]),
+            html.Div(className="filter-control", children=[html.Label("School"), dcc.Dropdown(id="school-filter", options=opts(students["school_current"]), value=[], multi=True, placeholder="All schools")]),
             html.Div(className="filter-control", children=[html.Label("Grade"), dcc.Dropdown(id="grade-filter", options=opts(students["grade_current"].dropna().astype(int)), value=[], multi=True, placeholder="All grades")]),
             html.Div(className="filter-control", children=[html.Label("Ethnicity"), dcc.Dropdown(id="ethnicity-filter", options=opts(students["ethnicity_group"]), value=[], multi=True, placeholder="All ethnicities")]),
             html.Div(className="filter-control", children=[html.Label("Dosage bucket"), dcc.Dropdown(id="dosage-bucket-filter", options=[{"label": bucket, "value": bucket} for bucket in DOSAGE_BUCKET_ORDER], value=[], multi=True, placeholder="All dosage buckets")]),
@@ -324,8 +324,11 @@ def filter_frame(df: pd.DataFrame, group, mode, subjects, years, periods, school
             out = out[out["school_year"].isin(years)]
     if periods and "period" in out.columns:
         out = out[out["period"].isin(periods)]
-    if schools and "school_group" in out.columns:
-        out = out[out["school_group"].isin(schools)]
+    if schools:
+        if "school_current" in out.columns:
+            out = out[out["school_current"].isin(schools)]
+        elif "school_group" in out.columns:
+            out = out[out["school_group"].isin(schools)]
     if grades and "grade_current" in out.columns:
         out = out[out["grade_current"].isin(grades)]
     if ethnicities and "ethnicity_group" in out.columns:
@@ -704,6 +707,8 @@ def filtered_snapshot(mode, group, subjects, years, periods, schools, grades, et
 
 
 def page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, dosage_programs, dosage_buckets):
+    if pathname == "/dosage":
+        group = "all"
     return (pathname,) + cache_key(mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids) + (
         normalize_values(dosage_programs),
         normalize_values(dosage_buckets),
@@ -1828,6 +1833,10 @@ def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
             ),
         )
 
+    # Dosage is a STEP UP-only analysis, so we normalize the display group here
+    # instead of inheriting potentially stale group labels from older merges.
+    dosage["student_group"] = "STEP UP"
+
     star = dfs["star"].copy()
     if len(star):
         star = star[star["value_type"].eq("score")].copy()
@@ -1940,16 +1949,21 @@ def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
     )
 
     student_count = summary["student_id"].nunique()
+    star_students = set(dfs["star"]["student_id"]) if len(dfs.get("star", pd.DataFrame())) else set()
+    caaspp_students = set(dfs["caaspp"]["student_id"]) if len(dfs.get("caaspp", pd.DataFrame())) else set()
+    attendance_students = set(dfs["attendance"]["student_id"]) if len(dfs.get("attendance", pd.DataFrame())) else set()
+    dosage_students = set(summary["student_id"])
+    all_three_count = len(dosage_students & star_students & caaspp_students & attendance_students)
     avg_sessions = summary["dosage_sessions_attended"].mean()
     avg_rate = summary["dosage_rate"].mean()
     median_sessions = summary["dosage_sessions_attended"].median()
     cards = html.Div(
         className="kpi-grid",
         children=[
-            kpi("Students with dosage", f"{student_count:,}", "Matched STEP UP students with attendance records"),
-            kpi("Avg attended sessions", f"{avg_sessions:.1f}", "Across matched dosage records"),
-            kpi("Average dosage rate", f"{avg_rate * 100:.1f}%", "Attended sessions divided by possible sessions"),
-            kpi("Median attended sessions", f"{median_sessions:.1f}", "Middle dosage value in the filtered view"),
+            kpi("Students with dosage data", f"{student_count:,}", "Students found in the STEP UP attendance file"),
+            kpi("Students with all measures", f"{all_three_count:,}", "Students with dosage, STAR, CAASPP, and attendance data"),
+            kpi("Average sessions attended", f"{avg_sessions:.1f}", "Average number of STEP UP sessions attended per student"),
+            kpi("Typical sessions attended", f"{median_sessions:.1f}", "The middle student in the filtered view"),
         ],
     )
     note = html.Div(
@@ -1957,8 +1971,12 @@ def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
         children=[
             html.H3("How to read this page"),
             html.P(
-                "Dosage here is the count of attended sessions across the STEP UP attendance workbook, normalized into comparable percentage buckets because the underlying programs have different session counts. "
+                "Dosage here means how many STEP UP sessions a student attended out of the sessions that were available to them. "
+                "We group students into percentage buckets so programs with different lengths can still be compared fairly. "
                 "Use the dosage bucket filter to narrow the view, then compare how STAR, CAASPP, and attendance move over time for students in that dose range."
+            ),
+            html.P(
+                f"In the current view, {all_three_count:,} students have dosage, STAR, CAASPP, and attendance data all together."
             ),
         ],
     )
@@ -2168,7 +2186,10 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
     if student_ids:
         students = students[students["student_id"].isin([str(x) for x in student_ids])]
     if schools:
-        students = students[students["school_group"].isin(schools)]
+        if "school_current" in students.columns:
+            students = students[students["school_current"].isin(schools)]
+        elif "school_group" in students.columns:
+            students = students[students["school_group"].isin(schools)]
     if grades:
         students = students[students["grade_current"].isin(grades)]
     if ethnicities:
@@ -2217,7 +2238,7 @@ def cascade_filter_options(mode, group, subjects, years, periods, schools, grade
     )
     year_options = opts(year_values)
     period_options = opts(growth["period"])
-    school_options = opts(students["school_group"])
+    school_options = opts(students["school_current"])
     grade_options = opts(students["grade_current"].dropna().astype(int))
     ethnicity_options = opts(students["ethnicity_group"])
     return student_options, subject_options, year_options, period_options, school_options, grade_options, ethnicity_options
@@ -2323,6 +2344,8 @@ def download_summary(n_clicks, metric, mode, group, years, schools, grades, ethn
 )
 def render(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, dosage_buckets):
     try:
+        if pathname == "/dosage":
+            group = "all"
         return cached_render_from_key(page_cache_key(pathname, mode, group, subjects, years, periods, schools, grades, ethnicities, student_ids, None, dosage_buckets))
     except Exception as exc:
         import traceback
@@ -2332,6 +2355,16 @@ def render(pathname, mode, group, subjects, years, periods, schools, grades, eth
         return error_panel(
             "The page could not be rendered on the server. Check the Render logs for the traceback, then I can fix the underlying data or callback error."
         )
+
+
+@app.callback(
+    Output("group-filter-wrap", "style"),
+    Input("url", "pathname"),
+)
+def toggle_group_filter(pathname):
+    if pathname == "/dosage":
+        return {"display": "none"}
+    return {}
 
 
 if __name__ == "__main__":
