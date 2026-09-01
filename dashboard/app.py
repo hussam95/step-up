@@ -1802,6 +1802,74 @@ def student_page(dfs):
     return page("Student Drilldown", "Search one or more students above to inspect the records we have for them.", html.Div([dcc.Graph(figure=fig_star, className="chart wide"), html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)]), html.H2("Students in selection"), table]))
 
 
+def dosage_table_frame(dosage: pd.DataFrame, dosage_buckets=None) -> pd.DataFrame:
+    summary = dosage.copy()
+    bucket_values = set(normalize_values(dosage_buckets))
+    if bucket_values:
+        summary = summary[summary["dosage_bucket"].isin(bucket_values)]
+    if summary.empty:
+        return summary
+
+    # Dosage is a STEP UP-only analysis, so do not carry forward older group labels.
+    summary["student_group"] = "STEP UP"
+    summary = summary.sort_values(["dosage_sessions_attended", "student_name"], ascending=[False, True]).copy()
+    summary["dosage_rate_display"] = summary["dosage_rate"].map(lambda x: f"{x * 100:.1f}%")
+    summary["dosage_sessions_attended"] = summary["dosage_sessions_attended"].astype(int)
+    summary["dosage_sessions_possible"] = summary["dosage_sessions_possible"].astype(int)
+    return summary
+
+
+def dosage_excel_bytes(summary: pd.DataFrame) -> bytes:
+    table_cols = [
+        "student_name",
+        "school_current",
+        "grade_current",
+        "student_group",
+        "dosage_sessions_attended",
+        "dosage_sessions_possible",
+        "dosage_rate_display",
+        "dosage_bucket",
+        "program_count",
+    ]
+    export = summary[table_cols].rename(
+        columns={
+            "student_name": "Student",
+            "school_current": "School",
+            "grade_current": "Grade",
+            "student_group": "Group",
+            "dosage_sessions_attended": "Attended",
+            "dosage_sessions_possible": "Possible",
+            "dosage_rate_display": "Dosage rate",
+            "dosage_bucket": "Bucket",
+            "program_count": "Programs",
+        }
+    )
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Dosage detail", index=False)
+        ws = writer.sheets["Dosage detail"]
+        from openpyxl.styles import Font, PatternFill
+
+        header_fill = PatternFill("solid", fgColor="12313F")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = Font(color="FFFFFF", bold=True)
+
+        bucket_col = list(export.columns).index("Bucket") + 1
+        for row_idx in range(2, ws.max_row + 1):
+            bucket = str(ws.cell(row_idx, bucket_col).value or "")
+            fill = PatternFill("solid", fgColor=DOSAGE_BUCKET_COLORS.get(bucket, "#FFFFFF").lstrip("#"))
+            for cell in ws[row_idx]:
+                cell.fill = fill
+
+        ws.auto_filter.ref = ws.dimensions
+        ws.freeze_panes = "A2"
+        for column_cells in ws.columns:
+            width = min(max(len(str(cell.value or "")) for cell in column_cells) + 2, 34)
+            ws.column_dimensions[column_cells[0].column_letter].width = width
+    return output.getvalue()
+
+
 def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
     dosage = dfs.get("dosage", pd.DataFrame()).copy()
     if dosage.empty:
@@ -1924,10 +1992,7 @@ def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
     fig_bucket = polish(fig_bucket)
     fig_bucket = soften_axes(fig_bucket, x_title="", y_title="Students", hide_repeated_y=False)
 
-    summary = dosage.sort_values(["dosage_sessions_attended", "student_name"], ascending=[False, True]).copy()
-    summary["dosage_rate_display"] = summary["dosage_rate"].map(lambda x: f"{x * 100:.1f}%")
-    summary["dosage_sessions_attended"] = summary["dosage_sessions_attended"].astype(int)
-    summary["dosage_sessions_possible"] = summary["dosage_sessions_possible"].astype(int)
+    summary = dosage_table_frame(dosage)
     table_cols = [
         "student_name",
         "school_current",
@@ -1944,7 +2009,7 @@ def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
         className="data-table compact-table",
         children=[
             html.Thead(html.Tr([header_cell(label) for label in table_labels])),
-            html.Tbody([html.Tr([html.Td(str(row.get(col, ""))) for col in table_cols]) for _, row in summary[table_cols].head(60).iterrows()]),
+            html.Tbody([html.Tr([html.Td(str(row.get(col, ""))) for col in table_cols]) for _, row in summary[table_cols].iterrows()]),
         ],
     )
 
@@ -1990,7 +2055,19 @@ def dosage_page(dfs, dosage_programs=None, dosage_buckets=None):
                 dcc.Graph(figure=fig_star, className="chart wide"),
                 html.Div(className="two-col", children=[dcc.Graph(figure=fig_ca), dcc.Graph(figure=fig_att)]),
                 dcc.Graph(figure=fig_bucket, className="chart wide"),
-                html.H2("Dosage student detail"),
+                html.Div(
+                    className="section-toolbar",
+                    children=[
+                        html.H2("Dosage student detail"),
+                        html.Div(
+                            className="snapshot-actions",
+                            children=[
+                                html.Button("Download Excel", id="download-dosage-button", className="download-button", n_clicks=0),
+                                dcc.Download(id="download-dosage"),
+                            ],
+                        ),
+                    ],
+                ),
                 html.Div(table, className="table-scroll"),
             ]
         ),
@@ -2326,6 +2403,30 @@ def download_summary(n_clicks, metric, mode, group, years, schools, grades, ethn
         raise PreventUpdate
     filename = f"step_up_summary_{str(metric or 'metric').lower().replace(' ', '_')}.xlsx"
     return dcc.send_bytes(summary_excel_bytes(rows), filename)
+
+
+@app.callback(
+    Output("download-dosage", "data"),
+    Input("download-dosage-button", "n_clicks"),
+    State("analysis-mode", "value"),
+    State("subject-filter", "value"),
+    State("year-filter", "value"),
+    State("period-filter", "value"),
+    State("school-filter", "value"),
+    State("grade-filter", "value"),
+    State("ethnicity-filter", "value"),
+    State("student-filter", "value"),
+    State("dosage-bucket-filter", "value"),
+    prevent_initial_call=True,
+)
+def download_dosage(n_clicks, mode, subjects, years, periods, schools, grades, ethnicities, student_ids, dosage_buckets):
+    if not n_clicks:
+        raise PreventUpdate
+    dfs = get_filtered(mode, "all", subjects, years, periods, schools, grades, ethnicities, student_ids)
+    summary = dosage_table_frame(dfs["dosage"], dosage_buckets)
+    if summary.empty:
+        raise PreventUpdate
+    return dcc.send_bytes(dosage_excel_bytes(summary), "step_up_dosage_detail.xlsx")
 
 
 @app.callback(
